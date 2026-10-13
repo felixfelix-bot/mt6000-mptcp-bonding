@@ -1,0 +1,111 @@
+---
+# The MPTCP-capable proxy.
+#
+# WHY xray-core and not sing-box/mptcpize: LEARNINGS §1 — mptcpize cannot
+# LD_PRELOAD a Go binary, so it silently produces plain TCP. xray sets the
+# sockopt itself via streamSettings.sockopt.tcpMPTCP.
+
+- name: Ensure the credentials are provided
+  ansible.builtin.assert:
+    that:
+      - mptcp_server_password | length > 0
+      - mptcp_server_password != 'CHANGEME'
+      - (not (wwan_enabled | bool)) or (wwan_key | length > 0 and wwan_key != 'CHANGEME')
+    fail_msg: >-
+      Credentials are required and are NOT stored in this repo.
+      export TG_MPTCP_PASSWORD='...'   (remote de-aggregation server)
+      export TG_WWAN_KEY='...'         (wireless uplink PSK)
+      ...or pass -e mptcp_server_password=... -e wwan_key=...
+
+- name: Render the proxy config
+  ansible.builtin.copy:
+    dest: "{{ xray_config_path }}"
+    mode: "0600"
+    content: "{{ xray_config | to_nice_json(indent=2) }}"
+  vars:
+    xray_config:
+      log:
+        loglevel: warning
+      inbounds:
+        - tag: socks-in
+          listen: 127.0.0.1
+          port: "{{ socks_port }}"
+          protocol: socks
+          settings:
+            udpEnabled: false
+        - tag: tproxy-in
+          listen: 0.0.0.0
+          port: "{{ tproxy_port }}"
+          protocol: dokodemo-door
+          settings:
+            network: tcp
+            followRedirect: true
+          streamSettings:
+            sockopt:
+              tproxy: tproxy
+      outbounds:
+        - tag: mptcp-out
+          protocol: shadowsocks
+          settings:
+            servers:
+              - address: "{{ mptcp_server_host }}"
+                port: "{{ mptcp_server_port }}"
+                method: "{{ mptcp_method }}"
+                password: "{{ mptcp_server_password }}"
+          streamSettings:
+            sockopt:
+              tcpMPTCP: true
+              tcpcongestion: cubic
+      routing:
+        rules:
+          - type: field
+            inboundTag: [tproxy-in]
+            outboundTag: mptcp-out
+  register: xray_cfg
+
+- name: Validate the proxy config
+  ansible.builtin.raw: xray run -test -c {{ xray_config_path }} >/dev/null 2>&1 && echo CFG_OK || { xray run -test -c {{ xray_config_path }} 2>&1 | tail -3; echo CFG_BAD; }
+  register: xray_test
+  changed_when: false
+  failed_when: "'CFG_OK' not in xray_test.stdout"
+
+- name: (Re)start the proxy only when needed
+  ansible.builtin.raw: |
+    run=$(pgrep -f 'xray run -c {{ xray_config_path }}' | head -1)
+    if [ -n "$run" ] && [ "{{ xray_cfg.changed }}" = "False" ]; then
+      echo "ALREADY_RUNNING"; exit 0
+    fi
+    pkill -f 'xray run -c {{ xray_config_path }}' 2>/dev/null
+    sleep 1
+    ( xray run -c {{ xray_config_path }} >/var/log/xray-bond.log 2>&1 & )
+    sleep 4
+    pgrep -f 'xray run -c {{ xray_config_path }}' >/dev/null && echo STARTED || echo FAILED
+  register: xray_run
+  changed_when: "'STARTED' in xray_run.stdout"
+  failed_when: "'FAILED' in xray_run.stdout"
+
+- name: Confirm the proxy is listening
+  ansible.builtin.raw: |
+    netstat -tlnp 2>/dev/null | grep -q ":{{ tproxy_port }} " && echo TP_OK || echo TP_MISSING
+    netstat -tlnp 2>/dev/null | grep -q ":{{ socks_port }} " && echo SOCKS_OK || echo SOCKS_MISSING
+  register: listeners
+  changed_when: false
+
+# ─── The proof that matters: is it ACTUALLY MPTCP? ──────────────────────────
+- name: Prove the path is MPTCP (not plain TCP)
+  ansible.builtin.raw: |
+    curl -s -m 20 --limit-rate 500k --socks5-hostname 127.0.0.1:{{ socks_port }} \
+         -o /dev/null "https://speed.cloudflare.com/__down?bytes=4000000" &
+    sleep 6
+    ss -Mti dst {{ mptcp_server_host }} 2>/dev/null | grep -c tcp-ulp-mptcp
+    wait 2>/dev/null
+  register: mptcp_proof
+  changed_when: false
+
+- name: Report the MPTCP verdict
+  ansible.builtin.debug:
+    msg: >-
+      listeners: {{ listeners.stdout_lines | join(', ') }} |
+      MPTCP sockets seen: {{ mptcp_proof.stdout | trim }}
+      {{ '✅ MPTCP confirmed' if (mptcp_proof.stdout | trim | int) > 0
+         else '❌ NO tcp-ulp-mptcp — the path is plain TCP, check LEARNINGS §1' }}

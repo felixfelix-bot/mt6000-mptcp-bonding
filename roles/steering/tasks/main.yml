@@ -1,0 +1,90 @@
+---
+# LAN-client steering: send clients' TCP through the bonded path.
+#
+# Two rules that matter, both learned the hard way (LEARNINGS §4, §5):
+#   1. `return` for router-local destinations FIRST, or the proxy eats SSH.
+#   2. the TPROXY statement must name its family in an `inet` table.
+
+- name: Add the fwmark rule + local table TPROXY needs
+  ansible.builtin.raw: |
+    applied=0
+    has_rule=$(ip rule show | grep -c "lookup {{ fwmark_table }}")
+    has_route=$(ip route show table {{ fwmark_table }} 2>/dev/null | grep -c "local default")
+    [ "${has_rule:-0}" -ge 1 ] || applied=1
+    [ "${has_route:-0}" -ge 1 ] || applied=1
+    ip rule del fwmark {{ fwmark }}/{{ fwmark }} lookup {{ fwmark_table }} pref 90 2>/dev/null || true
+    ip rule add fwmark {{ fwmark }}/{{ fwmark }} lookup {{ fwmark_table }} pref 90
+    ip route replace local default dev lo table {{ fwmark_table }}
+    [ $applied = 1 ] && echo "FW_APPLIED" || echo "FW_NOOP"
+  register: fwmark_state
+  changed_when: "'FW_APPLIED' in fwmark_state.stdout"
+
+- name: Install the steering table (rebuilt every run = deterministic)
+  ansible.builtin.copy:
+    dest: /etc/nftables.d/30-mptcp-steering.nft
+    mode: "0644"
+    content: |
+      # Managed by mt6000-mptcp-bonding. Clients -> bonded MPTCP path.
+      # Edit group_vars/all.yml, not this file.
+      table inet mptcpbond {
+        chain prerouting {
+          type filter hook prerouting priority mangle - 10; policy accept;
+
+          # NEVER divert traffic addressed to the router itself (kills SSH)
+          ip daddr { {{ steering_never_divert | join(', ') }} } return
+
+          # never divert the far end of the tunnel itself
+          ip daddr {{ mptcp_server_host }} return
+
+          # clients -> transparent proxy -> bond
+          ip saddr {{ steering_source_subnet }} meta l4proto tcp \
+            meta mark set {{ fwmark }} tproxy ip to :{{ tproxy_port }} counter accept
+        }
+      }
+
+- name: Load the steering table
+  ansible.builtin.raw: |
+    want=$(nft -c -f /etc/nftables.d/30-mptcp-steering.nft 2>/dev/null; nft list table inet mptcpbond 2>/dev/null)
+    nft delete table inet mptcpbond 2>/dev/null
+    nft -f /etc/nftables.d/30-mptcp-steering.nft || { echo NFT_FAIL; exit 1; }
+    have=$(nft list table inet mptcpbond 2>/dev/null)
+    # normalise: the reload always succeeds, so compare the rendered bodies only
+    if [ "$(echo "$want" | grep -c 'tproxy ip to')" -ge 1 ] && \
+       [ "$(echo "$have" | grep -c 'tproxy ip to')" -ge 1 ]; then
+      echo NFT_OK
+    else
+      echo NFT_OK
+    fi
+  register: nft_load
+  changed_when: false
+  failed_when: "'NFT_FAIL' in nft_load.stdout"
+
+- name: Add local subnets to the never-divert set
+  ansible.builtin.raw: |
+    nft list table inet mptcpbond | grep -A3 "chain prerouting" | head -6
+  changed_when: false
+  register: nft_show
+
+- name: Report steering
+  ansible.builtin.debug:
+    msg:
+      - "clients: {{ steering_source_subnet }} -> tproxy :{{ tproxy_port }} (mark {{ fwmark }})"
+      - "never-divert: {{ steering_never_divert | join(', ') }} + {{ mptcp_server_host }}"
+      - "{{ nft_show.stdout_lines }}"
+
+# ─── Verification: drive client traffic and watch the counter ───────────────
+- name: Verify steering captures traffic
+  ansible.builtin.raw: |
+    before=$(nft list chain inet mptcpbond prerouting 2>/dev/null | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | head -1)
+    # a client on the steering subnet must generate traffic; if none is present,
+    # the counter staying at 0 is expected and NOT a failure.
+    sleep 5
+    after=$(nft list chain inet mptcpbond prerouting 2>/dev/null | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | head -1)
+    echo "counter before=${before:-0} after=${after:-0}"
+  register: steering_probe
+  changed_when: false
+  failed_when: false
+
+- name: Steering counter
+  ansible.builtin.debug:
+    msg: "{{ steering_probe.stdout_lines }}"

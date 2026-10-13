@@ -1,0 +1,153 @@
+---
+# Two uplinks:
+#   wan2  = a repurposed LAN port (ethernet)   -> its own DHCP client
+#   wwan  = a wireless STA to the target SSID  -> its own DHCP client
+#
+# The box's real WAN port (eth1) is deliberately NOT touched.
+
+# ─── Uplink A: physical port as a second WAN ────────────────────────────────
+- name: Read current network device ports
+  ansible.builtin.raw: uci -q get network.@device[0].ports || echo ""
+  changed_when: false
+  register: dev_ports
+  when: wan2_enabled | bool
+
+- name: Detach {{ wan2_port }} from the LAN bridge (it becomes a WAN)
+  ansible.builtin.raw: |
+    uci del_list network.@device[0].ports='{{ wan2_port }}' 2>/dev/null
+    uci commit network
+    echo CHANGED
+  when:
+    - wan2_enabled | bool
+    - wan2_port in dev_ports.stdout
+  changed_when: true
+
+- name: Define the wan2 interface (idempotent)
+  ansible.builtin.raw: |
+    changed=0
+    [ "$(uci -q get network.wan2.proto)" = "dhcp" ] || { uci set network.wan2.proto='dhcp'; changed=1; }
+    [ "$(uci -q get network.wan2.device)" = "{{ wan2_port }}" ] || { uci set network.wan2.device='{{ wan2_port }}'; changed=1; }
+    [ "$(uci -q get network.wan2)" = "interface" ] || { uci set network.wan2=interface; changed=1; }
+    [ $changed = 1 ] && { uci commit network; echo CHANGED; } || echo OK
+  register: wan2_def
+  changed_when: "'CHANGED' in wan2_def.stdout"
+  when: wan2_enabled | bool
+
+# ─── Uplink B: wireless STA ─────────────────────────────────────────────────
+- name: Define the STA interface (idempotent)
+  ansible.builtin.raw: |
+    changed=0
+    set_v() { [ "$(uci -q get wireless.wwan_sta.$1)" = "$2" ] || { uci set wireless.wwan_sta.$1="$2"; changed=1; }; }
+    [ "$(uci -q get wireless.wwan_sta)" = "wifi-iface" ] || { uci set wireless.wwan_sta=wifi-iface; changed=1; }
+    uci -q get wireless.wwan_sta.device >/dev/null 2>&1 || { uci set wireless.wwan_sta.device='{{ wwan_device }}'; changed=1; }
+    set_v mode 'sta'
+    set_v network 'wwan'
+    set_v ssid '{{ wwan_ssid }}'
+    set_v encryption 'psk2'
+    set_v key '{{ wwan_key }}'
+    set_v disabled '0'
+    [ $changed = 1 ] && { uci commit wireless; echo CHANGED; } || echo OK
+  register: sta_def
+  changed_when: "'CHANGED' in sta_def.stdout"
+  when: wwan_enabled | bool
+
+- name: Define the wwan network interface
+  ansible.builtin.raw: |
+    changed=0
+    [ "$(uci -q get network.wwan)" = "interface" ] || { uci set network.wwan=interface; changed=1; }
+    [ "$(uci -q get network.wwan.proto)" = "dhcp" ] || { uci set network.wwan.proto='dhcp'; changed=1; }
+    [ $changed = 1 ] && { uci commit network; echo CHANGED; } || echo OK
+  register: wwan_def
+  changed_when: "'CHANGED' in wwan_def.stdout"
+  when: wwan_enabled | bool
+
+# ─── Bring the uplinks up ───────────────────────────────────────────────────
+- name: Reload network + wifi
+  ansible.builtin.raw: |
+    wifi reload >/dev/null 2>&1
+    /etc/init.d/network reload >/dev/null 2>&1
+    echo reloaded
+  when: wan2_def.changed or sta_def.changed or wwan_def.changed
+  changed_when: true
+
+- name: Wait for both uplinks to obtain addresses
+  ansible.builtin.raw: |
+    W="{{ wwan_iface }}"
+    E="{{ wan2_port }}"
+    for i in $(seq 1 40); do
+      w=$(ip -4 addr show "$W" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+      e=$(ip -4 addr show "$E" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+      if [ -n "$w" ] && [ -n "$e" ]; then
+        echo "WWAN_IP=$w"; echo "WAN2_IP=$e"; exit 0
+      fi
+      sleep 3
+    done
+    echo "TIMEOUT w='$w' e='$e'"
+    exit 1
+  register: uplinks_up
+  changed_when: false
+  retries: 2
+  delay: 10
+  until: "'WWAN_IP' in uplinks_up.stdout and 'WAN2_IP' in uplinks_up.stdout"
+
+- name: Record the addresses
+  ansible.builtin.set_fact:
+    wwan_ip: "{{ uplinks_up.stdout | regex_search('WWAN_IP=([0-9.]+)', '\\1') | first }}"
+    wan2_ip: "{{ uplinks_up.stdout | regex_search('WAN2_IP=([0-9.]+)', '\\1') | first }}"
+
+- name: Show the uplinks
+  ansible.builtin.debug:
+    msg: "uplink A ({{ wwan_iface }}) = {{ wwan_ip }} | uplink B ({{ wan2_port }}) = {{ wan2_ip }}"
+
+# ─── Policy routing — MANDATORY for the 2nd subflow (see LEARNINGS §2, §3) ──
+# NOTE: complex multi-line shell goes in a copied script, not inline in `raw`
+# (Ansible's raw action cannot split multi-line args safely).
+- name: Write the policy-routing script
+  ansible.builtin.copy:
+    dest: /tmp/mptcp-policy-routing.sh
+    mode: "0700"
+    content: |
+      #!/bin/sh
+      set -e
+      # a route WITHOUT a metric is invisible to bsbf-mptcp's filter
+      gwa=$(ip route show dev {{ wwan_iface }} | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
+      gwb=$(ip route show dev {{ wan2_port }} | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
+      [ -n "$gwa" ] || { echo NO_GW_A; exit 1; }
+      [ -n "$gwb" ] || { echo NO_GW_B; exit 1; }
+      ip route replace default via "$gwa" dev {{ wwan_iface }} metric 10
+      ip route replace default via "$gwb" dev {{ wan2_port }} metric 20
+
+      A="{{ wwan_ip }}"; B="{{ wan2_ip }}"
+      IF_A="{{ wwan_iface }}"; IF_B="{{ wan2_port }}"
+      T1={{ policy_table_b }}; T2={{ policy_table_a }}
+
+      # default route per source
+      ip route replace default via "$gwb" dev "$IF_B" table "$T1"
+      ip route replace default via "$gwa" dev "$IF_A" table "$T2"
+
+      # THE CONNECTED ROUTES (LEARNINGS §3 — without these, SSH to the box dies)
+      ip route replace {{ wan2_uplink_subnet }} dev "$IF_B" proto kernel scope link src "$B" table "$T1"
+      ip route replace {{ wwan_uplink_subnet }} dev "$IF_A" proto kernel scope link src "$A" table "$T1"
+      ip route replace {{ wan2_uplink_subnet }} dev "$IF_B" proto kernel scope link src "$B" table "$T2"
+      ip route replace {{ wwan_uplink_subnet }} dev "$IF_A" proto kernel scope link src "$A" table "$T2"
+
+      ip rule del from "$B"/32 lookup "$T1" pref 100 2>/dev/null || true
+      ip rule del from "$A"/32 lookup "$T2" pref 101 2>/dev/null || true
+      ip rule add from "$B"/32 lookup "$T1" pref 100
+      ip rule add from "$A"/32 lookup "$T2" pref 101
+      echo "GW_A=$gwa"; echo "GW_B=$gwb"; echo ROUTING_OK
+
+- name: Apply the policy routing
+  ansible.builtin.raw: |
+    # the script is idempotent (all `replace`/`del`+`add`); report whether the
+    # resulting state differs from what we already had.
+    before=$(ip rule show; ip route show table {{ policy_table_b }}; ip route show table {{ policy_table_a }})
+    sh /tmp/mptcp-policy-routing.sh >/dev/null
+    after=$(ip rule show; ip route show table {{ policy_table_b }}; ip route show table {{ policy_table_a }})
+    if [ "$before" = "$after" ]; then echo "ROUTE_NOOP"; else echo "ROUTE_APPLIED"; fi
+  register: policy
+  changed_when: "'ROUTE_APPLIED' in policy.stdout"
+
+- name: Policy routing in place
+  ansible.builtin.debug:
+    msg: "{{ policy.stdout_lines }}"

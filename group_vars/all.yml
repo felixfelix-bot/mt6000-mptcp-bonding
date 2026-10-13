@@ -1,0 +1,66 @@
+# ─── EDIT THESE ──────────────────────────────────────────────────────────────
+# Everything deployment-specific lives here. Nothing else needs editing.
+
+# --- Uplink 1: wireless STA -------------------------------------------------
+wwan_enabled: true
+wwan_ssid: "c03rad0r-7a"          # the AP to join
+# The PSK is a CREDENTIAL — never commit it. Supply it at run time:
+#   export TG_WWAN_KEY='...'      or      -e wwan_key='...'
+wwan_key: "{{ lookup('env', 'TG_WWAN_KEY') | default('CHANGEME', true) }}"
+wwan_iface: "phy1-sta0"           # created by the STA wifi-iface
+wwan_device: "radio1"             # radio the STA runs on
+wwan_uplink_subnet: "10.108.82.0/24"
+
+# --- Uplink 2: physical port ------------------------------------------------
+# The MT6000's WAN port (eth1) is left ALONE as the primary uplink.
+# A spare LAN port is repurposed as a second WAN.
+wan2_enabled: true
+wan2_port: "lan1"                 # the physical LAN port to repurpose
+wan2_uplink_subnet: "192.168.2.0/24"
+
+# --- MPTCP tunables ---------------------------------------------------------
+mptcp_subflows: 8
+mptcp_add_addr_accepted: 8
+# Reference: net.mptcp.pm_type 0 = netlink PM (subflows via endpoints),
+#            1 = fullmesh (kernel auto-creates). 0 is what we validated.
+mptcp_pm_type: 0
+
+# --- Remote MPTCP de-aggregation endpoint -----------------------------------
+# The other half of the bond: a host that speaks MPTCP (see tg-mptcp-server).
+# Both host and password are deployment-specific, so neither is committed.
+#   export TG_MPTCP_SERVER_HOST='host.example.net'
+mptcp_server_host: "{{ lookup('env', 'TG_MPTCP_SERVER_HOST') | default('mptcp.example.net', true) }}"
+mptcp_server_port: 65101
+mptcp_method: "chacha20-ietf-poly1305"
+mptcp_server_password: "{{ lookup('env', 'TG_MPTCP_PASSWORD') | default('CHANGEME', true) }}"
+
+# --- Transparent proxy (LAN clients -> bond) --------------------------------
+steering_enabled: true
+steering_source_subnet: "10.115.249.0/24"   # clients that should use the bond
+# Addresses that must NEVER be diverted into the proxy (LEARNINGS §5: this is
+# what stops the proxy from eating SSH to the router).
+#
+# These are EXAMPLE values from the reference deployment. You MUST replace them
+# with your own router's addresses and local subnets before running — leaving
+# your box's own address out of this list will divert its management traffic
+# into the proxy and cut your SSH access to the device.
+steering_never_divert:
+  - "10.115.249.1"
+  - "10.103.117.1"
+  - "192.168.2.16"
+  - "10.115.249.0/24"
+  - "10.103.117.0/24"
+  - "10.108.82.0/24"
+  - "192.168.2.0/24"
+socks_port: 1081                             # loopback-only SOCKS for testing
+tproxy_port: 1082                            # TPROXY inbound
+fwmark: "0x1"
+fwmark_table: 100                            # table for fwmark -> local delivery
+# Per-source policy tables (LEARNINGS §2). Must not collide with fwmark_table.
+policy_table_b: 200                          # ethernet subflow (rule pref 100)
+policy_table_a: 201                          # wifi subflow    (rule pref 101)
+
+# --- Paths ------------------------------------------------------------------
+mptcp_init_path: "/etc/init.d/mptcp-bond"
+xray_config_path: "/tmp/xray-bond.json"
+bsbf_dir: "/etc/bsbf"

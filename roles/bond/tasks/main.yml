@@ -1,0 +1,133 @@
+---
+# MPTCP endpoints + a deterministic endpoint keeper.
+#
+# We DO install and start the upstream bsbf-mptcp daemon (it is the packaged
+# implementation of this idea), but we do not trust it alone: it has two known
+# defects on this image (LEARNINGS §6) — a missing state dir that makes it
+# no-op silently, and a connectivity check that prunes one of our endpoints.
+# The keeper below is what actually holds the bond together.
+
+- name: Create bsbf-mptcp's state dir (it fails silently without it)
+  ansible.builtin.raw: |
+    if [ -f {{ bsbf_dir }}/bsbf-mptcp-subflow-backup ]; then
+      echo "BSBF_NOOP"
+    else
+      mkdir -p {{ bsbf_dir }} && touch {{ bsbf_dir }}/bsbf-mptcp-subflow-backup && echo "BSBF_APPLIED"
+    fi
+  register: bsbf_dir_state
+  changed_when: "'BSBF_APPLIED' in bsbf_dir_state.stdout"
+
+- name: Ensure both MPTCP subflow endpoints exist
+  ansible.builtin.raw: |
+    A="{{ wwan_ip }}"; B="{{ wan2_ip }}"
+    have=$(ip mptcp endpoint show 2>/dev/null)
+    echo "$have" | grep -q "$A" || ip mptcp endpoint add "$A" dev {{ wwan_iface }} subflow
+    echo "$have" | grep -q "$B" || ip mptcp endpoint add "$B" dev {{ wan2_port }} subflow
+    ip mptcp endpoint show
+  register: endpoints
+  changed_when: false
+
+- name: Write the endpoint keeper (deterministic, survives daemon pruning)
+  ansible.builtin.copy:
+    dest: /usr/sbin/mptcp-endpoint-keeper
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Holds BOTH subflow endpoints in place.
+      # Why not rely on bsbf-mptcp alone: see docs/LEARNINGS.md §6.
+      A="{{ wwan_ip }}"; B="{{ wan2_ip }}"
+      IF_A="{{ wwan_iface }}"; IF_B="{{ wan2_port }}"
+      while true; do
+        cur=$(ip mptcp endpoint show 2>/dev/null)
+        echo "$cur" | grep -q "$A" || ip mptcp endpoint add "$A" dev "$IF_A" subflow 2>/dev/null
+        echo "$cur" | grep -q "$B" || ip mptcp endpoint add "$B" dev "$IF_B" subflow 2>/dev/null
+        sleep 2
+      done
+
+- name: Start the keeper (only when it is not already running)
+  ansible.builtin.raw: |
+    if pgrep -f mptcp-endpoint-keeper >/dev/null 2>&1; then
+      echo ALREADY_RUNNING
+    else
+      ( /usr/sbin/mptcp-endpoint-keeper >/dev/null 2>&1 & )
+      sleep 3
+      pgrep -f mptcp-endpoint-keeper >/dev/null && echo STARTED || echo KEEPER_FAILED
+    fi
+  register: keeper
+  changed_when: "'STARTED' in keeper.stdout"
+  failed_when: "'KEEPER_FAILED' in keeper.stdout"
+
+- name: Write the boot-time bond service
+  ansible.builtin.copy:
+    dest: "{{ mptcp_init_path }}"
+    mode: "0755"
+    content: |
+      #!/bin/sh /etc/rc.common
+      START=99
+      STOP=10
+
+      get_v4() { ip -4 addr show "$1" 2>/dev/null | sed -n "s/.*inet \([0-9.]*\)\/.*/\1/p" | head -1; }
+      get_gw() { ip route show dev "$1" 2>/dev/null | sed -n "s/^default via \([0-9.]*\).*/\1/p" | head -1; }
+
+      start() {
+          i=0
+          while [ $i -lt 30 ]; do
+              W=$(get_v4 {{ wwan_iface }}); E=$(get_v4 {{ wan2_port }})
+              [ -n "$W" ] && [ -n "$E" ] && break
+              i=$((i+1)); sleep 2
+          done
+          [ -z "$W" ] && W="{{ wwan_ip }}"
+          [ -z "$E" ] && E="{{ wan2_ip }}"
+          GW_W=$(get_gw {{ wwan_iface }}); [ -z "$GW_W" ] && GW_W="{{ wwan_gw_default | default('') }}"
+          GW_E=$(get_gw {{ wan2_port }});  [ -z "$GW_E" ] && GW_E="{{ wan2_gw_default | default('') }}"
+
+          [ -n "$GW_W" ] && ip route replace default via "$GW_W" dev {{ wwan_iface }} metric 10
+          [ -n "$GW_E" ] && ip route replace default via "$GW_E" dev {{ wan2_port }} metric 20
+
+          # per-source policy routing (LEARNINGS §2) + connected routes (§3)
+          ip route replace default via "$GW_E" dev {{ wan2_port }} table {{ fwmark_table + 100 }}
+          ip route replace default via "$GW_W" dev {{ wwan_iface }} table {{ fwmark_table + 101 }}
+          ip route replace {{ wan2_uplink_subnet }} dev {{ wan2_port }} proto kernel scope link src "$E" table {{ fwmark_table + 100 }}
+          ip route replace {{ wwan_uplink_subnet }} dev {{ wwan_iface }} proto kernel scope link src "$W" table {{ fwmark_table + 100 }}
+          ip route replace {{ wan2_uplink_subnet }} dev {{ wan2_port }} proto kernel scope link src "$E" table {{ fwmark_table + 101 }}
+          ip route replace {{ wwan_uplink_subnet }} dev {{ wwan_iface }} proto kernel scope link src "$W" table {{ fwmark_table + 101 }}
+
+          ip rule del from "$E"/32 lookup 200 pref 100 2>/dev/null
+          ip rule del from "$W"/32 lookup 201 pref 101 2>/dev/null
+          ip rule add from "$E"/32 lookup 200 pref 100
+          ip rule add from "$W"/32 lookup 201 pref 101
+
+          ip mptcp limits set subflow {{ mptcp_subflows }} add_addr_accepted {{ mptcp_add_addr_accepted }}
+          ip mptcp endpoint add "$W" dev {{ wwan_iface }} subflow 2>/dev/null
+          ip mptcp endpoint add "$E" dev {{ wan2_port }} subflow 2>/dev/null
+
+          ( /usr/sbin/mptcp-endpoint-keeper >/dev/null 2>&1 & )
+          logger -t mptcp-bond "bonded $W({{ wwan_iface }}) + $E({{ wan2_port }})"
+      }
+
+      stop() {
+          pkill -f mptcp-endpoint-keeper 2>/dev/null
+          ip mptcp endpoint flush 2>/dev/null
+          ip rule del pref 100 2>/dev/null
+          ip rule del pref 101 2>/dev/null
+          logger -t mptcp-bond "stopped"
+      }
+
+      restart() { stop; start; }
+      service_triggers() { procd_add_reload_interface_trigger; }
+
+- name: Validate the init script syntax
+  ansible.builtin.raw: sh -n {{ mptcp_init_path }} && echo SYNTAX_OK
+  register: syntax
+  changed_when: false
+  failed_when: "'SYNTAX_OK' not in syntax.stdout"
+
+- name: Enable the bond service at boot (idempotent)
+  ansible.builtin.raw: |
+    ls /etc/rc.d/*mptcp-bond >/dev/null 2>&1 || { {{ mptcp_init_path }} enable; echo ENABLED; }
+  register: rc_enable
+  changed_when: "'ENABLED' in rc_enable.stdout"
+
+- name: Report the endpoints
+  ansible.builtin.debug:
+    msg: "{{ endpoints.stdout_lines }}"

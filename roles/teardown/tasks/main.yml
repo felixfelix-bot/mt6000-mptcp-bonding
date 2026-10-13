@@ -1,0 +1,38 @@
+---
+# Return the box to a plain router. Run with:  -e state=absent
+
+- name: Stop and disable the bond service
+  ansible.builtin.raw: |
+    {{ mptcp_init_path }} stop 2>/dev/null
+    {{ mptcp_init_path }} disable 2>/dev/null
+    pkill -f mptcp-endpoint-keeper 2>/dev/null
+    echo stopped
+  changed_when: true
+
+- name: Remove the steering table + policy routing
+  ansible.builtin.raw: |
+    nft delete table inet mptcpbond 2>/dev/null
+    rm -f /etc/nftables.d/30-mptcp-steering.nft
+    ip rule del pref 90 2>/dev/null
+    ip rule del pref 100 2>/dev/null
+    ip rule del pref 101 2>/dev/null
+    ip route flush table {{ fwmark_table }} 2>/dev/null
+    ip route flush table {{ fwmark_table + 100 }} 2>/dev/null
+    ip route flush table {{ fwmark_table + 101 }} 2>/dev/null
+    ip mptcp endpoint flush 2>/dev/null
+    echo unwound
+  changed_when: true
+
+- name: Stop the proxy
+  ansible.builtin.raw: |
+    pkill -f 'xray run -c {{ xray_config_path }}' 2>/dev/null
+    rm -f {{ xray_config_path }} /usr/sbin/mptcp-endpoint-keeper
+    echo proxy-stopped
+  changed_when: true
+
+- name: Leave the uplink UCI config in place (harmless when unused)
+  ansible.builtin.debug:
+    msg: >-
+      wan2/wwan UCI sections are intentionally kept (they are just DHCP clients).
+      To remove them: uci delete network.wan2 && uci delete wireless.wwan_sta &&
+      uci delete network.wwan && uci commit

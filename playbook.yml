@@ -1,0 +1,93 @@
+---
+# Multi-WAN MPTCP bonding for GL-MT6000 / OpenWrt 25.12.
+#
+#   ansible-playbook -i inventory/hosts.yml playbook.yml --check
+#   ansible-playbook -i inventory/hosts.yml playbook.yml
+#
+# Revert:  -e state=absent
+#
+# Prereq: `ssh <inventory host>` works (docs/ACCESS.md) and python3 is on the
+#         target (the common role installs it if missing).
+
+- name: Bond the MT6000's WAN with a wireless STA uplink
+  hosts: mt6000
+  gather_facts: false
+
+  tasks:
+    - name: Ensure credentials are supplied (they are never committed)
+      ansible.builtin.assert:
+        that:
+          - mptcp_server_password | length > 0
+          - mptcp_server_password != 'CHANGEME'
+          - (not (wwan_enabled | bool)) or (wwan_key | length > 0 and wwan_key != 'CHANGEME')
+        fail_msg: >-
+          Credentials are NOT stored in this repo. Supply them at run time:
+          export TG_MPTCP_PASSWORD='...'  (remote de-aggregation server)
+          export TG_WWAN_KEY='...'        (wireless uplink PSK)
+          ...or pass -e mptcp_server_password=... -e wwan_key=...
+        success_msg: "credentials supplied"
+      when: (state | default('present')) == 'present'
+
+    - name: Preflight — reachability + python3
+      ansible.builtin.raw: |
+        test -x /usr/bin/python3 || apk add python3 >/dev/null 2>&1
+        /usr/bin/python3 -c 'print("python-ok")'
+      changed_when: false
+      register: preflight
+      failed_when: "'python-ok' not in preflight.stdout"
+
+    - name: Detect the automations that reconcile our config
+      ansible.builtin.raw: |
+        for s in tollgate-wrt mwan3; do
+          if [ -x /etc/init.d/$s ]; then
+            /etc/init.d/$s running >/dev/null 2>&1 && echo "$s=running" || echo "$s=stopped"
+          fi
+        done
+      changed_when: false
+      register: reconcilers
+
+    - name: Warn when a reconciler owns /etc/config/wireless
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: {{ reconcilers.stdout_lines | join(' ') }}.
+          tollgate-wrt rewrites /etc/config/wireless — if the STA section
+          disappears after a while, stop it during provisioning with
+          -e stop_tollgate=true, or accept it as the managed owner.
+      when: "'running' in reconcilers.stdout"
+
+    - name: Stop TollGate's reconciler during provisioning (opt-in)
+      ansible.builtin.raw: /etc/init.d/tollgate-wrt stop
+      when: stop_tollgate | default(false) | bool
+      changed_when: true
+
+    - name: Apply roles
+      ansible.builtin.include_role:
+        name: "{{ role_name }}"
+      loop:
+        - common
+        - uplinks
+        - bond
+        - proxy
+        - steering
+      loop_control:
+        loop_var: role_name
+      when: (state | default('present')) == 'present'
+
+    - name: Revert the bond
+      ansible.builtin.include_role:
+        name: teardown
+      when: (state | default('present')) == 'absent'
+
+    - name: Report the resulting bond
+      ansible.builtin.raw: |
+        echo "--- uplinks ---"; ip -br -4 addr | grep -vE ' lo |br-|docker'
+        echo "--- mptcp endpoints ---"; ip mptcp endpoint show 2>/dev/null
+        echo "--- defaults ---"; ip route | grep default
+      changed_when: false
+      register: report
+      when: (state | default('present')) == 'present'
+
+    - name: Bond status
+      ansible.builtin.debug:
+        msg: "{{ report.stdout_lines }}"
+      when: (state | default('present')) == 'present'
