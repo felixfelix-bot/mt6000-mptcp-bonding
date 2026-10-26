@@ -1,0 +1,129 @@
+---
+- name: Validate mwan3 variables
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Check package era (apk takes precedence over opkg)
+  ansible.builtin.raw: |
+    if command -v apk >/dev/null 2>&1; then echo apk;
+    elif command -v opkg >/dev/null 2>&1; then echo ipk;
+    else echo unknown; exit 1; fi
+  register: mwan3_package_era
+  changed_when: false
+
+- name: Warn loudly that ipk installation is unsupported
+  ansible.builtin.debug:
+    msg: "WARNING: MWAN3 SKIPPED on ipk/opkg firmware; no mwan3 configuration changed."
+  when: mwan3_package_era.stdout | trim == 'ipk'
+
+- name: Configure the apk-era mwan3 implementation
+  when: mwan3_package_era.stdout | trim == 'apk'
+  block:
+    - name: Check existing uplinks and distinct main-table metrics
+      ansible.builtin.raw: |
+        set -eu
+        metrics=' '
+        {% for member in mwan3_members %}
+        iface={{ member.iface | quote }}
+        [ "$(uci -q get network.$iface)" = interface ] || { echo "Missing network.$iface"; exit 1; }
+        metric=$(uci -q get network.$iface.metric) || {
+          echo "Set a distinct network.$iface.metric before mwan3 deployment"; exit 1;
+        }
+        case "$metric" in ''|*[!0-9]*) echo "Invalid network metric for $iface"; exit 1;; esac
+        case "$metrics" in *" $metric "*) echo "Duplicate network metric: $metric"; exit 1;; esac
+        metrics="$metrics$metric "
+        {% endfor %}
+      changed_when: false
+
+    - name: Require existing WAN-zone NAT and LAN forwarding for every member
+      ansible.builtin.raw: |
+        # OpenWrt helpers intentionally read unset optional shell variables.
+        set -e
+        . /lib/functions.sh
+        check_zone() {
+          local section="$1" name networks masq
+          config_get name "$section" name
+          config_get networks "$section" network
+          config_get masq "$section" masq 0
+          [ "$name" = wan ] && [ "$masq" = 1 ] || return 0
+          case " $networks " in *" $iface "*) zoned=1;; esac
+        }
+        check_forward() {
+          local section="$1" src dest
+          config_get src "$section" src
+          config_get dest "$section" dest
+          [ "$src" != lan ] || [ "$dest" != wan ] || forwarded=1
+          return 0
+        }
+        config_load firewall
+        forwarded=0
+        config_foreach check_forward forwarding
+        [ "$forwarded" = 1 ] || { echo 'Require existing lan -> wan forwarding'; exit 1; }
+        {% for member in mwan3_members %}
+        iface={{ member.iface | quote }}
+        zoned=0
+        config_foreach check_zone zone
+        [ "$zoned" = 1 ] || { echo "Add $iface to the masquerading wan firewall zone before deploying"; exit 1; }
+        {% endfor %}
+      changed_when: false
+
+    - name: Snapshot before package installation or first config write
+      ansible.builtin.raw: |
+        set -eu
+        backup={{ mwan3_backup_dir | quote }}
+        if [ -f "$backup/config" ] || [ -f "$backup/config.absent" ]; then
+          echo MWAN3_NOOP
+        else
+          mkdir -p "$backup"
+          chmod 700 "$backup"
+          if [ -e /etc/config/mwan3 ]; then
+            cp -p /etc/config/mwan3 "$backup/config"
+          else
+            touch "$backup/config.absent"
+          fi
+          echo MWAN3_APPLIED
+        fi
+      register: mwan3_backup
+      changed_when: "'MWAN3_APPLIED' in mwan3_backup.stdout_lines"
+
+    - name: Install mwan3 from the configured apk feeds
+      ansible.builtin.raw: |
+        set -eu
+        if apk info -e mwan3 >/dev/null 2>&1; then
+          echo MWAN3_NOOP
+        else
+          apk add mwan3
+          echo MWAN3_APPLIED
+        fi
+      register: mwan3_install
+      changed_when: "'MWAN3_APPLIED' in mwan3_install.stdout_lines"
+
+    - name: Compare rendered config then commit and restart only when needed
+      ansible.builtin.raw: |
+        set -eu
+        staging=$(mktemp -d /etc/config/.mwan3-render.XXXXXX)
+        trap 'rm -rf "$staging"' EXIT HUP INT TERM
+        printf '%s' {{ lookup('template', 'mwan3.j2') | b64encode | quote }} | base64 -d > "$staging/mwan3"
+        # Canonicalize before comparing: uci commit otherwise changes whitespace.
+        uci -c "$staging" export mwan3 >/dev/null
+        uci -c "$staging" import mwan3 < "$staging/mwan3"
+        uci -c "$staging" commit mwan3
+        changed=0
+        if ! cmp -s "$staging/mwan3" /etc/config/mwan3; then
+          touch {{ (mwan3_backup_dir + '/restart-pending') | quote }}
+          cp "$staging/mwan3" /etc/config/mwan3
+          uci commit mwan3
+          changed=1
+        fi
+        if ! /etc/init.d/mwan3 enabled; then
+          /etc/init.d/mwan3 enable
+          changed=1
+        fi
+        if [ "$changed" = 1 ] || [ -f {{ (mwan3_backup_dir + '/restart-pending') | quote }} ] || ! /etc/init.d/mwan3 running; then
+          /etc/init.d/mwan3 restart
+          rm -f {{ (mwan3_backup_dir + '/restart-pending') | quote }}
+          echo MWAN3_APPLIED
+        else
+          echo MWAN3_NOOP
+        fi
+      register: mwan3_config
+      changed_when: "'MWAN3_APPLIED' in mwan3_config.stdout_lines"

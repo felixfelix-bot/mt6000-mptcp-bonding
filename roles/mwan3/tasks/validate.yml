@@ -1,0 +1,65 @@
+---
+- name: Validate nonempty mwan3 collections and unique names
+  ansible.builtin.assert:
+    that:
+      - mwan3_members | length > 0
+      - mwan3_policies | length > 0
+      - mwan3_rules | length > 0
+      - mwan3_track_ips | length > 0
+      - mwan3_members | map(attribute='iface') | unique | length == mwan3_members | length
+      - mwan3_policies | map(attribute='name') | unique | length == mwan3_policies | length
+      - mwan3_rules | map(attribute='name') | unique | length == mwan3_rules | length
+    fail_msg: "mwan3 requires nonempty members, policies, rules and tracking IPs; names must be unique."
+
+- name: Validate member weights and metrics without coercing strings or booleans
+  ansible.builtin.assert:
+    that:
+      - item.iface is match('^[a-zA-Z][a-zA-Z0-9_]{0,14}$')
+      - item.weight is integer
+      - item.weight is not boolean
+      - item.weight >= 1
+      - item.metric is integer
+      - item.metric is not boolean
+      - item.metric >= 1
+      - item.iface != 'wwan' or wwan_enabled | bool
+      - item.iface != 'wan2' or wan2_enabled | bool
+    fail_msg: "Each mwan3 member needs a safe iface name and integer weight/metric >= 1 (not quoted strings or booleans), and its uplink must be enabled."
+  loop: "{{ mwan3_members }}"
+
+- name: Validate policies and member references
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-zA-Z][a-zA-Z0-9_]{0,14}$')
+      - item.members | length > 0
+      - item.members | difference(mwan3_members | map(attribute='iface') | list) | length == 0
+      - item.last_resort | default('unreachable') in ['unreachable', 'blackhole', 'default']
+    fail_msg: "mwan3 policy needs a safe name, known member interfaces and a valid last_resort."
+  loop: "{{ mwan3_policies }}"
+
+- name: Validate rules
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-zA-Z][a-zA-Z0-9_]{0,14}$')
+      - item.proto | default('all') in ['all', 'tcp', 'udp', 'icmp']
+      - item.dest_ip is match('^[0-9.]+(/[0-9]{1,2})?$')
+      - item.src_ip | default('0.0.0.0/0') is match('^[0-9.]+(/[0-9]{1,2})?$')
+      - item.use_policy in (mwan3_policies | map(attribute='name') | list)
+    fail_msg: "mwan3 rules require safe names, IPv4 addresses/CIDRs, a supported protocol and a known policy."
+  loop: "{{ mwan3_rules }}"
+
+- name: Validate tracking addresses
+  ansible.builtin.assert:
+    that: item is match('^[0-9.]+$')
+    fail_msg: "mwan3_track_ips must contain IPv4 addresses."
+  loop: "{{ mwan3_track_ips }}"
+
+- name: Reject colliding UCI section names
+  vars:
+    section_names: >-
+      {{ ['globals'] + (mwan3_members | map(attribute='iface') | list)
+         + (mwan3_members | map(attribute='iface') | map('regex_replace', '$', '_member') | list)
+         + (mwan3_policies | map(attribute='name') | list)
+         + (mwan3_rules | map(attribute='name') | list) }}
+  ansible.builtin.assert:
+    that: section_names | unique | length == section_names | length
+    fail_msg: "mwan3 interface, generated member, policy and rule names must not collide."

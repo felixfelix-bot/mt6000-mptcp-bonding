@@ -1,81 +1,9 @@
 ---
-# Packages + kernel MPTCP tunables.
-# Everything this repo needs is in the stock OpenWrt 25.12 feed.
+- name: Provision the original MPTCP toolchain and tunables
+  ansible.builtin.include_tasks: mptcp.yml
+  when: uplink_mode == 'mptcp'
 
-# /tmp on OpenWrt is a tmpfs capped at ~half RAM. A full /tmp makes Ansible
-# itself fail ("No space left on device" while copying module payloads), so
-# reclaim it first. Found the hard way after throughput tests filled it.
-- name: Reclaim /tmp (Ansible copies its module payload there)
-  ansible.builtin.raw: |
-    avail=$(df -k /tmp | awk 'NR==2{print $4}')
-    if [ "${avail:-0}" -lt 30000 ]; then
-      find /tmp -maxdepth 1 -type f -size +1M -delete 2>/dev/null
-      rm -rf /tmp/.ansible_tmp* 2>/dev/null
-      echo "RECLAIMED avail_kb=$(df -k /tmp | awk 'NR==2{print $4}')"
-    else
-      echo "OK avail_kb=$avail"
-    fi
-  register: tmp_space
-  changed_when: "'RECLAIMED' in tmp_space.stdout"
-
-- name: Check which packages are present
-  ansible.builtin.raw: |
-    for p in ip-full ss mptcpize bsbf-mptcp xray-core nftables tcpdump; do
-      apk info -e "$p" >/dev/null 2>&1 && echo "$p=1" || echo "$p=0"
-    done
-  changed_when: false
-  register: pkg_state
-
-- name: Install the MPTCP toolchain (ip-full provides `ip mptcp`)
-  ansible.builtin.raw: apk add ip-full ss mptcpize >/dev/null 2>&1 || apk add ip-full >/dev/null 2>&1
-  when: "'ip-full=0' in pkg_state.stdout or 'ss=0' in pkg_state.stdout"
-  changed_when: true
-
-- name: Install the bonding daemon (GPL-2.0; invoked, never vendored)
-  ansible.builtin.raw: apk add bsbf-mptcp >/dev/null 2>&1
-  when: "'bsbf-mptcp=0' in pkg_state.stdout"
-  changed_when: true
-
-- name: Install the MPTCP-capable proxy (xray-core)
-  ansible.builtin.raw: apk add xray-core >/dev/null 2>&1
-  when: "'xray-core=0' in pkg_state.stdout"
-  changed_when: true
-
-- name: Install nftables + tcpdump for steering and verification
-  ansible.builtin.raw: apk add nftables tcpdump >/dev/null 2>&1
-  when: "'nftables=0' in pkg_state.stdout or 'tcpdump=0' in pkg_state.stdout"
-  changed_when: true
-
-- name: Assert kernel MPTCP is available (built into the MT6000 image)
-  ansible.builtin.raw: |
-    e=$(sysctl -n net.mptcp.enabled 2>/dev/null)
-    echo "net.mptcp.enabled=$e"
-    [ "$e" = "1" ] || echo "MPTCP_MISSING"
-  changed_when: false
-  register: mptcp_kernel
-  failed_when: "'MPTCP_MISSING' in mptcp_kernel.stdout"
-
-- name: Enable kernel MPTCP if it exists but is off
-  ansible.builtin.raw: sysctl -w net.mptcp.enabled=1
-  when: "'net.mptcp.enabled=0' in mptcp_kernel.stdout"
-  changed_when: true
-
-- name: Set MPTCP limits (subflow ceiling)
-  ansible.builtin.raw: |
-    have=$(ip mptcp limits show 2>/dev/null)
-    hs=$(echo "$have" | sed -n 's/.*subflows \([0-9]*\).*/\1/p')
-    ha=$(echo "$have" | sed -n 's/.*add_addr_accepted \([0-9]*\).*/\1/p')
-    if [ "${hs:-x}" = "{{ mptcp_subflows }}" ] && [ "${ha:-x}" = "{{ mptcp_add_addr_accepted }}" ]; then
-      echo "MPTCP_NOOP"
-    else
-      ip mptcp limits set subflow {{ mptcp_subflows }} add_addr_accepted {{ mptcp_add_addr_accepted }}
-      echo "MPTCP_APPLIED"
-    fi
-  register: limits
-  changed_when: "'MPTCP_APPLIED' in limits.stdout"
-
-- name: Report the toolchain
+- name: Explain the mwan3 common baseline
   ansible.builtin.debug:
-    msg:
-      - "kernel: {{ mptcp_kernel.stdout_lines }}"
-      - "limits: {{ mptcp_subflows }} subflows / {{ mptcp_add_addr_accepted }} add_addr"
+    msg: "mwan3 uses the existing OpenWrt network/firewall; no MPTCP packages or sysctls are applied."
+  when: uplink_mode == 'mwan3'

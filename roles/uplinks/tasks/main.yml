@@ -25,9 +25,9 @@
 - name: Define the wan2 interface (idempotent)
   ansible.builtin.raw: |
     changed=0
+    [ "$(uci -q get network.wan2)" = "interface" ] || { uci set network.wan2=interface; changed=1; }
     [ "$(uci -q get network.wan2.proto)" = "dhcp" ] || { uci set network.wan2.proto='dhcp'; changed=1; }
     [ "$(uci -q get network.wan2.device)" = "{{ wan2_port }}" ] || { uci set network.wan2.device='{{ wan2_port }}'; changed=1; }
-    [ "$(uci -q get network.wan2)" = "interface" ] || { uci set network.wan2=interface; changed=1; }
     [ $changed = 1 ] && { uci commit network; echo CHANGED; } || echo OK
   register: wan2_def
   changed_when: "'CHANGED' in wan2_def.stdout"
@@ -71,6 +71,7 @@
   changed_when: true
 
 - name: Wait for both uplinks to obtain addresses
+  when: uplink_mode == 'mptcp'
   ansible.builtin.raw: |
     W="{{ wwan_iface }}"
     E="{{ wan2_port }}"
@@ -91,11 +92,13 @@
   until: "'WWAN_IP' in uplinks_up.stdout and 'WAN2_IP' in uplinks_up.stdout"
 
 - name: Record the addresses
+  when: uplink_mode == 'mptcp'
   ansible.builtin.set_fact:
     wwan_ip: "{{ uplinks_up.stdout | regex_search('WWAN_IP=([0-9.]+)', '\\1') | first }}"
     wan2_ip: "{{ uplinks_up.stdout | regex_search('WAN2_IP=([0-9.]+)', '\\1') | first }}"
 
 - name: Show the uplinks
+  when: uplink_mode == 'mptcp'
   ansible.builtin.debug:
     msg: "uplink A ({{ wwan_iface }}) = {{ wwan_ip }} | uplink B ({{ wan2_port }}) = {{ wan2_ip }}"
 
@@ -103,6 +106,7 @@
 # NOTE: complex multi-line shell goes in a copied script, not inline in `raw`
 # (Ansible's raw action cannot split multi-line args safely).
 - name: Write the policy-routing script
+  when: uplink_mode == 'mptcp'
   ansible.builtin.copy:
     dest: /tmp/mptcp-policy-routing.sh
     mode: "0700"
@@ -138,6 +142,7 @@
       echo "GW_A=$gwa"; echo "GW_B=$gwb"; echo ROUTING_OK
 
 - name: Apply the policy routing
+  when: uplink_mode == 'mptcp'
   ansible.builtin.raw: |
     # the script is idempotent (all `replace`/`del`+`add`); report whether the
     # resulting state differs from what we already had.
@@ -149,5 +154,6 @@
   changed_when: "'ROUTE_APPLIED' in policy.stdout"
 
 - name: Policy routing in place
+  when: uplink_mode == 'mptcp'
   ansible.builtin.debug:
     msg: "{{ policy.stdout_lines }}"

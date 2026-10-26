@@ -1,0 +1,13 @@
+---
+- name: Offline validation and render (no router access)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+  tasks:
+    - name: Validate input
+      ansible.builtin.include_tasks: ../roles/mwan3/tasks/validate.yml
+    - name: Render using Ansible template lookup
+      ansible.builtin.debug:
+        msg: "{{ lookup('template', '../roles/mwan3/templates/mwan3.j2') }}"

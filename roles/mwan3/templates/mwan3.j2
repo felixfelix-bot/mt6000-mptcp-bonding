@@ -1,0 +1,42 @@
+# Managed by mt6000-mptcp-bonding; IPv4 per-flow balancing, not bonding.
+config globals 'globals'
+        option mmx_mask '0x3F00'
+{% for member in mwan3_members %}
+
+config interface '{{ member.iface }}'
+        option enabled '1'
+        option family 'ipv4'
+        option initial_state 'online'
+        option track_method 'ping'
+        option reliability '1'
+        option count '1'
+        option timeout '2'
+        option interval '5'
+        option down '3'
+        option up '3'
+{% for address in mwan3_track_ips %}
+        list track_ip '{{ address }}'
+{% endfor %}
+
+config member '{{ member.iface }}_member'
+        option interface '{{ member.iface }}'
+        option metric '{{ member.metric }}'
+        option weight '{{ member.weight }}'
+{% endfor %}
+{% for policy in mwan3_policies %}
+
+config policy '{{ policy.name }}'
+{% for iface in policy.members %}
+        list use_member '{{ iface }}_member'
+{% endfor %}
+        option last_resort '{{ policy.last_resort | default('unreachable') }}'
+{% endfor %}
+{% for rule in mwan3_rules %}
+
+config rule '{{ rule.name }}'
+        option family 'ipv4'
+        option proto '{{ rule.proto | default('all') }}'
+        option src_ip '{{ rule.src_ip | default('0.0.0.0/0') }}'
+        option dest_ip '{{ rule.dest_ip }}'
+        option use_policy '{{ rule.use_policy }}'
+{% endfor %}

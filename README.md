@@ -6,7 +6,43 @@ stock **OpenWrt 25.12.5**, kernel **6.12.94**.
 Bonds a **physical WAN port** with a **wireless STA uplink** into one MPTCP
 meta-connection, proxied to a remote MPTCP-capable de-aggregation server.
 
-Everything here is **Ansible** — no manual steps, no token burn to re-do it.
+Provisioning is **Ansible**. The optional mwan3 mode requires preconfigured WAN
+firewall/NAT/forwarding and routing metrics; see the prerequisites below.
+
+## Optional weighted multi-WAN (mwan3)
+
+`uplink_mode: mptcp` remains the default. Set `uplink_mode: mwan3` for IPv4-only,
+**per-flow load balancing**, not packet aggregation: each connection uses one
+uplink, with no MPTCP proxy or remote de-aggregation server.
+
+The mwan3 path runs `common` + `uplinks` + `mwan3`, skipping the MPTCP toolchain,
+bond, proxy and steering configuration. Package installation supports `apk`;
+`opkg` systems are explicitly skipped with a loud diagnostic, not silently
+reported as supported.
+
+Defaults assign `wan2` weight 3 and `wwan` weight 1, both at member metric 1.
+Equal-metric weights give an approximate **3:1 ratio of new flows, not bytes**;
+lower member metrics select preferred links and higher metrics provide failover.
+Tracking defaults are `1.1.1.1` and `8.8.8.8`.
+
+Before applying, configure the participating uplinks in the WAN firewall zone,
+with NAT/masquerading and LAN-to-WAN forwarding, and give their network routes
+**distinct routing metrics**. These route metrics are separate from mwan3 member
+metrics. The role validates prerequisites; it does not rewrite existing WAN or
+firewall configuration.
+
+```sh
+ansible-playbook -i inventory/hosts.yml playbook.yml -e uplink_mode=mwan3 --check
+ansible-playbook -i inventory/hosts.yml playbook.yml -e uplink_mode=mwan3
+```
+
+**Do not switch modes in place.** Run `-e state=absent` for the current mode first,
+then apply the new mode. See [MWAN3-WEIGHTS.md](docs/MWAN3-WEIGHTS.md) for the full
+configuration, persistent backup/restore contract, and verification commands.
+
+**New-mode evidence: offline-only.** No live router run happened: SSH access was
+blocked by publickey-only authentication, with no usable key held. The MPTCP
+measurements below do not validate mwan3 balancing, failover or teardown.
 
 ---
 
