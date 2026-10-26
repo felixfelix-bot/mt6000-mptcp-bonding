@@ -1,0 +1,24 @@
+---
+# Steering defaults. Objectives map to routing tables that already exist on the
+# box (OMR pins each uplink to network.<iface>.ip4table). Nothing here invents a
+# table: validate.yml fails if a declared table disagrees with uci.
+steering_enabled: false
+
+# Rules created by this role live inside this preference band, so reconcile can
+# delete only its own entries and never touch OMR's (0/1/100/10000/20000/900xx).
+steering_rule_pref_base: 12000
+steering_rule_pref_span: 200
+
+# objective -> table. "main" means "no rule": the client keeps the default
+# (bond/tunnel) path.
+steering_objectives:
+  minimize_cost:
+    table: 11
+  maximize_speed:
+    table: 13
+  balanced:
+    table: main
+
+# client -> objective. Addresses only; no MAC, no hostname (they drift).
+steering_clients: []
+#  - {ip: 192.168.50.180, objective: minimize_cost}

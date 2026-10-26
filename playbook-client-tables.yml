@@ -1,0 +1,28 @@
+---
+# Per-client routing-table selection only. Touches nothing else on the box.
+#
+#   ansible-playbook -i inventory/hosts.yml playbook-client-tables.yml
+#   ansible-playbook -i inventory/hosts.yml playbook-client-tables.yml -e state=absent
+#
+# Verify from the router, not from this play's recap:
+#   ssh root@<router> 'ip rule list | awk "\$1 ~ /^120/"'
+- name: Steer clients to an uplink table by objective
+  hosts: mt6000
+  gather_facts: false
+  tasks:
+    - name: Remove this role's rules when state=absent
+      when: (state | default('present')) == 'absent'
+      block:
+        - name: Delete every rule in the owned band
+          ansible.builtin.raw: |
+            BASE={{ client_tables_pref_base | int }}
+            TOP=$(( BASE + {{ client_tables_pref_span | int }} ))
+            for p in $(ip rule list | awk -v a="$BASE" -v b="$TOP" '{p=$1; sub(":","",p); if (p+0>=a+0 && p+0<=b+0) print p+0}' | sort -u); do
+              ip rule del pref "$p" || true
+            done
+            echo "CLIENT_TABLES_CLEARED"
+          changed_when: true
+
+    - name: Reconcile when state=present
+      ansible.builtin.import_tasks: roles/client_tables/tasks/main.yml
+      when: (state | default('present')) == 'present'

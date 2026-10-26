@@ -1,0 +1,32 @@
+---
+# Per-client routing-table selection (objective → uplink table).
+#
+# This is deliberately NOT the steering role: that one sends LAN clients into
+# the bonded TPROXY path. This one pins *individual* clients to a specific
+# uplink's routing table, which is the only way to express a buyer's objective
+# on OpenMPTCProuter (mwan3 is uninstallable there, and the MPTCP scheduler has
+# no weight knob — see docs/MWAN3-WEIGHTS.md).
+client_tables_enabled: false
+
+# Rules created here live in this preference band, so reconcile deletes only its
+# own entries and never OMR's (0, 1, 100, 10000, 20000, 900xx).
+client_tables_pref_base: 12000
+client_tables_pref_span: 200
+
+# objective -> table. "main" = no rule: the client keeps the default (bond) path.
+client_tables_objectives:
+  minimize_cost:
+    table: 11
+  maximize_speed:
+    table: 13
+  balanced:
+    table: main
+
+# Traffic to these destinations keeps the local table, so a steered client can
+# still reach the router (SSH, LuCI, DNS) instead of losing its LAN route.
+client_tables_local_exempt_cidrs:
+  - 192.168.50.0/24
+
+# client -> objective. Addresses only: MACs and hostnames drift.
+client_tables_clients: []
+#  - {ip: 192.168.50.180, objective: minimize_cost}
