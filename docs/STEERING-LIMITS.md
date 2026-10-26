@@ -74,3 +74,39 @@ consequences to decide first, because they are product decisions, not code:
 Until those are answered, this repository ships **no** per-client steering. The
 `pr/client-tables` branch keeps the role and its nine offline tests as the basis
 for the mark-based version; it is deliberately unmerged.
+
+## Second attempt: set the mark early (also insufficient)
+
+A mark-based variant was built and run: an `inet` chain at `priority mangle - 20`
+(-170, ahead of OMR's `-160`) setting the uplink's own OMR mark
+(`0x453911` for table 11) with `accept`, plus a `counter`. Rendered fragment is
+derived from `uci network.<iface>.ip4table` and validated with `nft -c`.
+
+It installs, self-verifies, and reverts cleanly, and the counter proves the rule
+**does** match client traffic:
+
+```text
+nft list table inet client_egress
+  ip saddr 192.168.50.180 counter packets 849 bytes 65032 meta mark set 0x00453911 accept
+```
+
+But the traffic still did not follow the mark. A 20 MB download from that client
+moved:
+
+```text
+lan3 rx +355,752 B        <- the uplink the mark named (table 11)
+phy1 rx +30,296,125 B     <- the uplink that carried it
+counter +67 packets       <- but a 20 MB transfer is ~14k packets
+```
+
+So the rule sees only a sliver of the client's packets (the rest are handled
+before it, or re-marked downstream), and egress stays on the bond. Marking at
+prerouting is therefore **not** sufficient either. Establishing the real
+mechanism needs `nft ... trace` on a live flow, which is a deliberate
+instrumented session, not a guess.
+
+## Status
+
+No per-client steering ships. The two roles (`pr/client-tables`, and the
+mark-based `pr/client-egress`) are kept unmerged with their tests; this file is
+the record of what was measured.

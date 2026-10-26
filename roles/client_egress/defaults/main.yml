@@ -1,0 +1,28 @@
+---
+# Per-client egress selection that actually takes effect on OMR.
+#
+# A `from <client>` routing rule is unreachable: OMR TPROXY-marks LAN client TCP
+# and installs `from all fwmark 0x1 lookup 100` at preference 0 (see
+# docs/STEERING-LIMITS.md). The mark is therefore the only lever that runs early
+# enough — set it to the uplink's OWN OMR mark (0x4539<hex table>) in a chain that
+# runs before the TPROXY chain, and end evaluation for that packet.
+#
+# Metering: the same rule carries a `counter`, so a pinned client's bytes are
+# still countable even though it no longer traverses the transparent proxy.
+# Those counters are the input to billing — see `--tags report`.
+client_egress_enabled: false
+
+# priority must be < the TPROXY chain's (mangle - 10) so our mark wins.
+client_egress_priority: "mangle - 20"
+client_egress_table_name: client_egress
+client_egress_fragment: /etc/nftables.d/40-client-egress.nft
+
+# objective -> uplink. The role resolves the uplink's ip4table and derives the
+# OMR mark 0x45390000 | table, rather than hard-coding a mark per box.
+client_egress_objectives:
+  minimize_cost: wan3
+  maximize_speed: wwan
+  balanced: bond            # "bond" = no rule: keep the metered TPROXY path
+
+client_egress_clients: []
+#  - {ip: 192.168.50.180, objective: minimize_cost}

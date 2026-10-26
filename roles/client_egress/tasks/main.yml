@@ -1,0 +1,112 @@
+---
+# Render, validate and install the per-client egress mark chain.
+# Everything is derived from uci: the uplink's ip4table and OMR's own mark
+# scheme (0x45390000 | table). A missing uplink or table fails before the box is
+# touched, and the rendered fragment is syntax-checked with `nft -c` first.
+
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - client_egress_objectives | length > 0
+      - client_egress_priority | length > 0
+    fail_msg: "client_egress_objectives and priority must be set"
+
+- name: Every client must name a declared objective
+  ansible.builtin.assert:
+    that: item.objective in client_egress_objectives
+    fail_msg: "client {{ item.ip }} names unknown objective {{ item.objective }}"
+  loop: "{{ client_egress_clients | default([]) }}"
+  loop_control:
+    label: "{{ item.ip }}"
+
+- name: Resolve each objective's uplink table from uci and prove it routes
+  ansible.builtin.raw: |
+    set -eu
+    {% for obj, iface in client_egress_objectives.items() %}
+    {% if iface | string != 'bond' %}
+    tbl=$(uci -q get network.{{ iface }}.ip4table || true)
+    [ -n "${tbl:-}" ] || { echo "MISSING_TABLE: objective {{ obj }} names uplink {{ iface }} with no ip4table"; exit 1; }
+    ip route show table "$tbl" | grep -q '^default' || { echo "NO_DEFAULT: table $tbl ({{ obj }})"; exit 1; }
+    ip rule list | grep -q "fwmark 0x4539$tbl " || { echo "NO_FWMARK_RULE: OMR does not route 0x4539$tbl (table $tbl)"; exit 1; }
+    echo "OBJ {{ obj }} iface={{ iface }} table=$tbl mark=0x4539$tbl"
+    {% else %}
+    echo "OBJ {{ obj }} iface=bond table=-"
+    {% endif %}
+    {% endfor %}
+  register: ce_resolve
+  changed_when: false
+
+- name: Render the fragment, resolving OMR marks at render time
+  ansible.builtin.raw: |
+    set -eu
+    F={{ client_egress_fragment }}
+    mkdir -p "$(dirname "$F")"
+    {
+      echo "# Managed by mt6000-mptcp-bonding (roles/client_egress)."
+      echo "# Edit group_vars/all.yml, not this file."
+      echo "# A from-src routing rule cannot work on OMR: the TPROXY fwmark rule"
+      echo "# sits at preference 0 (docs/STEERING-LIMITS.md). The mark is the lever."
+      echo "table inet {{ client_egress_table_name }} {"
+      echo "  chain pre {"
+      echo "    type filter hook prerouting priority {{ client_egress_priority }}; policy accept;"
+      {% for c in (client_egress_clients | default([]) | sort(attribute='ip')) %}
+      {% set iface = client_egress_objectives[c.objective] | string %}
+      {% if iface != 'bond' %}
+      tbl=$(uci -q get network.{{ iface }}.ip4table)
+      # OMR appends the DECIMAL table number: table 11 -> 0x453911
+      mark="0x4539${tbl}"
+      echo "    ip saddr {{ c.ip }} counter meta mark set $mark accept comment \"{{ c.objective }}\""
+      {% endif %}
+      {% endfor %}
+      echo "  }"
+      echo "}"
+    } > "$F"
+    nft -c -f "$F" || { echo NFT_INVALID; exit 1; }
+    echo RENDERED
+  register: ce_render
+  changed_when: "'RENDERED' in ce_render.stdout"
+
+- name: Install the fragment, reloading only when its content changed
+  ansible.builtin.raw: |
+    set -eu
+    F={{ client_egress_fragment }}
+    T={{ client_egress_table_name }}
+    H="$F.sha256"
+    # BusyBox on this OMR image ships sha256sum but not sha1sum.
+    want=$(sha256sum "$F" | awk '{print $1}')
+    have=$(cat "$H" 2>/dev/null || echo none)
+    if [ "$want" = "$have" ] && nft list table inet "$T" >/dev/null 2>&1; then
+      echo NOOP
+      exit 0
+    fi
+    nft delete table inet "$T" 2>/dev/null || true
+    nft -f "$F"
+    nft list table inet "$T" >/dev/null
+    echo "$want" > "$H"
+    echo APPLIED
+  register: ce_install
+  changed_when: "'APPLIED' in ce_install.stdout"
+
+- name: Read back the installed chain (evidence, not the play recap)
+  ansible.builtin.raw: |
+    nft list table inet {{ client_egress_table_name }} | sed -n '/chain pre/,/}/p'
+  register: ce_show
+  changed_when: false
+
+- name: Post-condition, every steered client has a mark rule
+  ansible.builtin.assert:
+    that:
+      # nft normalises marks to 8 hex digits: 0x453911 prints as 0x00453911
+      # live nft prints the counter values between 'counter' and 'meta mark'
+      - ce_show.stdout is search('ip saddr ' + item.ip + ' counter packets [0-9]+ bytes [0-9]+ meta mark set 0x0*4539')
+    fail_msg: "{{ item.ip }} has no mark rule in inet {{ client_egress_table_name }}"
+  loop: "{{ client_egress_clients | default([]) }}"
+  loop_control:
+    label: "{{ item.ip }} -> {{ item.objective }}"
+  when: client_egress_objectives[item.objective] | string != 'bond'
+
+- name: Report resolution and installed rules
+  ansible.builtin.debug:
+    msg:
+      - "{{ ce_resolve.stdout_lines }}"
+      - "{{ ce_show.stdout_lines }}"

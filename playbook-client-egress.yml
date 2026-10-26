@@ -1,0 +1,24 @@
+---
+# Per-client egress selection (mark-based). Touches only its own nft table.
+#
+#   ansible-playbook -i inventory/hosts.yml playbook-client-egress.yml
+#   ansible-playbook -i inventory/hosts.yml playbook-client-egress.yml -e state=absent
+#
+# Verify from the router, not from this play's recap:
+#   ssh root@<router> 'nft list table inet client_egress'
+- name: Steer a client's egress to one uplink by objective
+  hosts: mt6000
+  gather_facts: false
+  tasks:
+    - name: Remove the chain when state=absent
+      ansible.builtin.raw: |
+        nft delete table inet {{ client_egress_table_name }} 2>/dev/null || true
+        rm -f {{ client_egress_fragment }} {{ client_egress_fragment }}.sha1
+        echo CLIENT_EGRESS_CLEARED
+      when: (state | default('present')) == 'absent'
+      changed_when: "'CLIENT_EGRESS_CLEARED' in client_egress_clear.stdout"
+      register: client_egress_clear
+
+    - name: Reconcile when state=present
+      ansible.builtin.import_tasks: roles/client_egress/tasks/main.yml
+      when: (state | default('present')) == 'present'

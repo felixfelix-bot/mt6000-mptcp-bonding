@@ -82,6 +82,20 @@ mt6000_authorized_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP6hWTsriB0pGcQjUOBm0yUlKIVuTMHbm0vvpQZKUi+1 t14-mt6000-2026"
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBXpTNvCZscqPoACa8p6YnwfvGDHTEIot1GmE56D7Hl+ tollgate-virtual-lab"
 
+# --- Per-client egress by mark (roles/client_egress) ------------------------
+# A from-src ip rule is defeated by OMR's TPROXY fwmark at pref 0
+# (docs/STEERING-LIMITS.md), so the lever is the packet mark: 0x45390000 |
+# <uplink ip4table>. "bond" = no rule = stay on the metered TPROXY path.
+client_egress_objectives:
+  minimize_cost: wan3
+  maximize_speed: wwan
+  balanced: bond
+client_egress_priority: "mangle - 20"
+client_egress_table_name: client_egress
+client_egress_fragment: /etc/nftables.d/40-client-egress.nft
+client_egress_clients: []
+#  - {ip: 192.168.50.180, objective: minimize_cost}
+
 # --- Paths ------------------------------------------------------------------
 mptcp_init_path: "/etc/init.d/mptcp-bond"
 xray_config_path: "/tmp/xray-bond.json"
