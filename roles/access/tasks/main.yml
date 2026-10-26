@@ -1,0 +1,26 @@
+---
+# Reproducible shell access. Public keys only — never a private key, never a
+# password. The key list lives in group_vars so access is reviewable in git.
+- name: Ensure /etc/dropbear exists
+  ansible.builtin.raw: mkdir -p /etc/dropbear && chmod 700 /etc/dropbear
+  changed_when: false
+
+- name: Ensure authorized_keys exists with mode 0600
+  ansible.builtin.raw: touch /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys
+  changed_when: false
+
+- name: Add each authorised public key (idempotent, exact-line match)
+  ansible.builtin.raw: |
+    grep -qxF '{{ item }}' /etc/dropbear/authorized_keys || echo '{{ item }}' >> /etc/dropbear/authorized_keys
+  loop: "{{ mt6000_authorized_keys }}"
+  register: access_keys
+  changed_when: access_keys.stdout is defined and access_keys.stdout | length > 0
+
+- name: Report key count (never prints key material)
+  ansible.builtin.raw: wc -l < /etc/dropbear/authorized_keys
+  register: access_count
+  changed_when: false
+
+- name: Keys present
+  ansible.builtin.debug:
+    msg: "authorized_keys lines: {{ access_count.stdout | trim }}"

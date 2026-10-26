@@ -19,6 +19,10 @@
         that: uplink_mode in ['mptcp', 'mwan3']
         fail_msg: "uplink_mode must be mptcp or mwan3"
 
+    - name: Reconcile shell access from group_vars (public keys only)
+      ansible.builtin.include_tasks: roles/access/tasks/main.yml
+      tags: [access]
+
     - name: Validate mwan3 settings before touching the router
       ansible.builtin.include_tasks: roles/mwan3/tasks/validate.yml
       when: uplink_mode == 'mwan3' and (state | default('present')) == 'present'
@@ -31,6 +35,18 @@
       register: mwan3_era
       changed_when: false
       when: uplink_mode == 'mwan3' and (state | default('present')) == 'present'
+
+    - name: Fail fast when the package repo cannot satisfy mwan3
+      ansible.builtin.raw: |
+        apk add --simulate mwan3 >/tmp/mwan3-sim.log 2>&1 || {
+          echo "MWAN3_UNINSTALLABLE"; grep -E 'no such package|required by' /tmp/mwan3-sim.log; exit 1; }
+      register: mwan3_sim
+      failed_when: mwan3_sim.rc != 0
+      changed_when: false
+      when:
+        - uplink_mode == 'mwan3'
+        - (state | default('present')) == 'present'
+        - mwan3_era.stdout | default('') | trim == 'apk'
 
     - name: Warn loudly on unsupported ipk era
       ansible.builtin.debug:

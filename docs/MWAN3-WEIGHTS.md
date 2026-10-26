@@ -7,6 +7,43 @@ per-flow load balancing and failover. This is **not packet aggregation** and doe
 not combine both uplinks' bandwidth for a single connection. It needs no remote
 MPTCP server.
 
+### mwan3 is not installable on OpenMPTCProuter
+
+Measured on the bench GL-MT6000 running OpenMPTCProuter v0.64.2-6.18
+(kernel 6.18.39, `apk` era):
+
+```text
+$ apk add mwan3
+ERROR: unable to select packages:
+  iptables-mod-conntrack-extra (no such package):
+    required by: mwan3-2.12.2-r1[iptables-mod-conntrack-extra]
+$ apk search -x iptables-mod-conntrack-extra iptables-mod-ipset
+(no results)
+$ apk info -e iptables
+iptables-nft                       # nft-backed iptables; no legacy modules
+```
+
+OMR ships `iptables-nft` only; `mwan3` needs `iptables-mod-conntrack-extra` from
+the legacy module set, which is absent from the OMR package feed. `uplink_mode:
+mwan3` therefore cannot run on an OMR image — on stock OpenWrt it can.
+
+The playbook now fails fast instead of half-deploying: the task *Fail fast when
+the package repo cannot satisfy mwan3* runs `apk add --simulate mwan3` before any
+configuration and stops with the dependency named:
+
+```text
+mt6000 | FAILED | rc=2 >>
+ERROR: unable to select packages:
+  iptables-mod-conntrack-extra (no such package):
+    required by: mwan3-2.12.2-r1[iptables-mod-conntrack-extra]
+```
+
+Consequence for TollGate buyer-side steering: on OMR the objective can only be
+expressed as **per-client routing-table selection** (cheapest uplink / fastest
+uplink / the bond), not as weights. Weights remain available on stock-OpenWrt
+firmware only.
+
+
 **Status: offline-only for this new mode.** No live router run happened. SSH
 access was blocked by publickey-only authentication and no usable key was held.
 The repository's existing MPTCP measurements are not mwan3 evidence. The commands

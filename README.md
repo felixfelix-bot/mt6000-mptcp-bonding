@@ -164,3 +164,26 @@ docs/
 
 MIT (this repo). `bsbf-mptcp` is a separate GPL-2.0-only project — it is
 **invoked**, never vendored. `xray-core` is MPL-2.0. See `docs/LEARNINGS.md`.
+
+## Shell access (IaC)
+
+`/etc/dropbear/authorized_keys` is configuration, not a manual step: the key list
+lives in `group_vars/all.yml` (`mt6000_authorized_keys`) and is reconciled by
+`roles/access`, idempotently and public-keys-only.
+
+```sh
+ansible-playbook -i inventory/hosts.yml playbook-access.yml        # access only
+ansible-playbook -i inventory/hosts.yml playbook.yml --syntax-check # full run
+```
+
+Target selection is environment-driven, so the production box and a bench unit
+share one tracked inventory:
+
+```sh
+MT6000_HOST=vil4 ansible-playbook -i inventory/hosts.yml playbook-access.yml
+MT6000_HOST=192.168.50.1 MT6000_KEY=~/.ssh/id_ed25519 \
+  ansible-playbook -i inventory/hosts.yml playbook-access.yml
+```
+
+Re-running is a no-op (`changed=0`) once the keys are present — measured on the
+bench, `ok=5 changed=0`, two keys installed.

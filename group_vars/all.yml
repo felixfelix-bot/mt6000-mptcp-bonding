@@ -76,6 +76,12 @@ fwmark_table: 100                            # table for fwmark -> local deliver
 policy_table_b: 200                          # ethernet subflow (rule pref 100)
 policy_table_a: 201                          # wifi subflow    (rule pref 101)
 
+# --- Shell access (public keys only; enforced by roles/access) --------------
+# Access is configuration, so it lives in git. Never commit a private key.
+mt6000_authorized_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP6hWTsriB0pGcQjUOBm0yUlKIVuTMHbm0vvpQZKUi+1 t14-mt6000-2026"
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBXpTNvCZscqPoACa8p6YnwfvGDHTEIot1GmE56D7Hl+ tollgate-virtual-lab"
+
 # --- Paths ------------------------------------------------------------------
 mptcp_init_path: "/etc/init.d/mptcp-bond"
 xray_config_path: "/tmp/xray-bond.json"

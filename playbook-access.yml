@@ -1,0 +1,13 @@
+---
+# Access-only entry point: reconcile /etc/dropbear/authorized_keys from
+# group_vars without touching bonding, firewall or uplink configuration.
+#
+#   ansible-playbook -i inventory/hosts.yml playbook-access.yml
+#   MT6000_HOST=192.168.50.1 MT6000_KEY=~/.ssh/id_ed25519 \
+#     ansible-playbook -i inventory/hosts.yml playbook-access.yml
+- name: Reconcile shell access
+  hosts: mt6000
+  gather_facts: false
+  tasks:
+    - name: Apply the reviewed key list
+      ansible.builtin.import_tasks: roles/access/tasks/main.yml
