@@ -1,0 +1,37 @@
+---
+- name: Stop managed mwan3, remove its runtime objects and restore first-write backup
+  ansible.builtin.raw: |
+    set -eu
+    backup={{ mwan3_backup_dir | quote }}
+    if [ ! -f "$backup/config" ] && [ ! -f "$backup/config.absent" ]; then
+      echo MWAN3_NOOP
+      exit 0
+    fi
+    if [ -x /etc/init.d/mwan3 ]; then
+      # Native stop removes mwan3 rules, routes, chains and sets on its backend.
+      /etc/init.d/mwan3 stop
+      /etc/init.d/mwan3 disable
+    fi
+    # Only mwan3-owned namespaces, never flush the shared fw4 ruleset.
+    if command -v nft >/dev/null 2>&1; then
+      for family in inet ip ip6; do
+        if nft list table "$family" mwan3 >/dev/null 2>&1; then
+          nft delete table "$family" mwan3
+        fi
+      done
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+      for name in $(ipset list -name); do
+        case "$name" in mwan3_*) ipset destroy "$name";; esac
+      done
+    fi
+    if [ -f "$backup/config" ]; then
+      cp -p "$backup/config" /etc/config/mwan3
+    else
+      rm -f /etc/config/mwan3
+    fi
+    rm -f "$backup/config" "$backup/config.absent" "$backup/restart-pending"
+    rmdir "$backup"
+    echo MWAN3_APPLIED
+  register: mwan3_teardown
+  changed_when: "'MWAN3_APPLIED' in mwan3_teardown.stdout_lines"

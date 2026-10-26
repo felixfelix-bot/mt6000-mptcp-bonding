@@ -1,6 +1,22 @@
 # ─── EDIT THESE ──────────────────────────────────────────────────────────────
 # Everything deployment-specific lives here. Nothing else needs editing.
 
+# --- Mode: mptcp (default) or mwan3 (IPv4 per-flow balancing) ----------------
+uplink_mode: mptcp
+mwan3_members:
+  - {iface: wan2, weight: 3, metric: 1}
+  - {iface: wwan, weight: 1, metric: 1}
+mwan3_policies:
+  - name: balanced
+    members: [wan2, wwan]
+    last_resort: unreachable
+mwan3_rules:
+  - name: default_ipv4
+    proto: all
+    dest_ip: 0.0.0.0/0
+    use_policy: balanced
+mwan3_track_ips: [1.1.1.1, 8.8.8.8]
+
 # --- Uplink 1: wireless STA -------------------------------------------------
 wwan_enabled: true
 wwan_ssid: "c03rad0r-7a"          # the AP to join

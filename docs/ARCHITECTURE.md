@@ -1,5 +1,60 @@
 # ARCHITECTURE — the packet path
 
+## Mode comparison
+
+`uplink_mode: mptcp` remains the default. The alternative `uplink_mode: mwan3`
+is IPv4-only weighted **per-flow** routing, not packet aggregation.
+
+| Property | `mptcp` (default) | `mwan3` (optional) |
+|---|---|---|
+| Role path | `common` + `uplinks` + `bond` + `proxy` + `steering` | `common` + `uplinks` + `mwan3` |
+| Traffic path | TPROXY → xray → MPTCP subflows → remote server | mwan3 policy → one uplink per flow → WAN NAT → destination |
+| Remote endpoint | MPTCP de-aggregation server required | No aggregation server required |
+| Single connection | Can use multiple MPTCP subflows | Uses one uplink; no combined-link throughput |
+| Link selection | MPTCP scheduler and endpoints | Lowest available member metric, then weights among equal metrics |
+| Toolchain | MPTCP tools, proxy and steering | Skips MPTCP toolchain, proxy and steering; `apk` supported, `opkg` loudly skipped |
+| Evidence | Historical MPTCP observations below and in `MEASUREMENTS.md` | Offline-only; no live router validation |
+
+The mwan3 defaults are `wan2_member` (interface `wan2`, metric 1, weight 3) and
+`wwan_member` (interface `wwan`, metric 1, weight 1), with tracking addresses
+`1.1.1.1` and `8.8.8.8`. Names are generated as `<iface>_member`. The `balanced`
+policy references `[wan2, wwan]` with `last_resort: unreachable`; the
+`default_ipv4` rule matches `proto: all`, `dest_ip: 0.0.0.0/0` and uses `balanced`.
+Equal member metrics yield an approximate 3:1 **flow ratio, not byte ratio**.
+Lower member metrics provide preference/failover, independent of weights.
+
+```
+LAN client IPv4 flow
+  → mwan3 rule (default_ipv4)
+  → balanced policy (lowest available member metric)
+  → weighted choice: wan2 (3) OR wwan (1)
+  → preconfigured WAN forwarding + NAT
+  → destination (no proxy, no de-aggregation server)
+```
+
+Participating interfaces must already have distinct **network routing metrics**
+and belong to the WAN firewall zone with NAT/masquerading and LAN-to-WAN
+forwarding. The role validates these prerequisites instead of mutating existing
+WAN/firewall configuration. Equal mwan3 member metrics do not mean equal network
+route metrics. The historical MPTCP note below about unzoned `wan2` is **not** a
+valid mwan3 deployment configuration.
+
+Switching modes requires explicit `state=absent` for the current mode before
+applying the other. The original mwan3 config is retained at
+`/etc/mt6000-mwan3-backup/config`, or its original absence is recorded by
+`config.absent` in the same directory. Backup state persists until teardown
+restores the original state, then removes it.
+
+See [MWAN3-WEIGHTS.md](MWAN3-WEIGHTS.md) for configuration and verification.
+No live mwan3 router run happened: publickey-only SSH authentication blocked
+access and no usable key was held. Balancing, failover and restore remain
+unverified on hardware.
+
+## Default MPTCP packet path
+
+The diagram, routing tables and measurements below describe **MPTCP mode only**;
+they are not installed by the mwan3 path.
+
 ```
                  ┌──────────────────── GL-MT6000 (OpenWrt 25.12.5) ───────────────────┐
                  │                                                                     │

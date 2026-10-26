@@ -14,11 +14,37 @@
   gather_facts: false
 
   tasks:
+    - name: Validate the selected mode
+      ansible.builtin.assert:
+        that: uplink_mode in ['mptcp', 'mwan3']
+        fail_msg: "uplink_mode must be mptcp or mwan3"
+
+    - name: Validate mwan3 settings before touching the router
+      ansible.builtin.include_tasks: roles/mwan3/tasks/validate.yml
+      when: uplink_mode == 'mwan3' and (state | default('present')) == 'present'
+
+    - name: Detect package era for mwan3 before any provisioning
+      ansible.builtin.raw: |
+        if command -v apk >/dev/null 2>&1; then echo apk;
+        elif command -v opkg >/dev/null 2>&1; then echo ipk;
+        else echo unknown; exit 1; fi
+      register: mwan3_era
+      changed_when: false
+      when: uplink_mode == 'mwan3' and (state | default('present')) == 'present'
+
+    - name: Warn loudly on unsupported ipk era
+      ansible.builtin.debug:
+        msg: "WARNING: mwan3 mode SKIPPED: ipk/opkg firmware is unsupported; no configuration was changed."
+      when: mwan3_era.stdout | default('') | trim == 'ipk'
+
+    - name: End this host cleanly on ipk era
+      ansible.builtin.meta: end_host
+      when: mwan3_era.stdout | default('') | trim == 'ipk'
+
     - name: Ensure credentials are supplied (they are never committed)
       ansible.builtin.assert:
         that:
-          - mptcp_server_password | length > 0
-          - mptcp_server_password != 'CHANGEME'
+          - uplink_mode != 'mptcp' or (mptcp_server_password | length > 0 and mptcp_server_password != 'CHANGEME')
           - (not (wwan_enabled | bool)) or (wwan_key | length > 0 and wwan_key != 'CHANGEME')
         fail_msg: >-
           Credentials are NOT stored in this repo. Supply them at run time:
@@ -34,6 +60,7 @@
         /usr/bin/python3 -c 'print("python-ok")'
       changed_when: false
       register: preflight
+      when: uplink_mode == 'mptcp'
       failed_when: "'python-ok' not in preflight.stdout"
 
     - name: Detect the automations that reconcile our config
@@ -60,15 +87,25 @@
       when: stop_tollgate | default(false) | bool
       changed_when: true
 
+    - name: Require explicit teardown before switching routing engines
+      ansible.builtin.raw: |
+        {% if uplink_mode == 'mwan3' %}
+        if [ -x {{ mptcp_init_path | quote }} ] && {{ mptcp_init_path | quote }} enabled; then
+          echo 'Run -e state=absent before switching from MPTCP to mwan3'; exit 1
+        fi
+        {% else %}
+        if [ -d /etc/mt6000-mwan3-backup ] && [ -x /etc/init.d/mwan3 ] && /etc/init.d/mwan3 enabled; then
+          echo 'Stop and tear down mwan3 before enabling MPTCP'; exit 1
+        fi
+        {% endif %}
+        echo MODE_OK
+      changed_when: false
+      when: (state | default('present')) == 'present'
+
     - name: Apply roles
       ansible.builtin.include_role:
         name: "{{ role_name }}"
-      loop:
-        - common
-        - uplinks
-        - bond
-        - proxy
-        - steering
+      loop: "{{ ['common', 'uplinks', 'bond', 'proxy', 'steering'] if uplink_mode == 'mptcp' else ['common', 'uplinks', 'mwan3'] }}"
       loop_control:
         loop_var: role_name
       when: (state | default('present')) == 'present'
@@ -81,13 +118,17 @@
     - name: Report the resulting bond
       ansible.builtin.raw: |
         echo "--- uplinks ---"; ip -br -4 addr | grep -vE ' lo |br-|docker'
+        {% if uplink_mode == 'mptcp' %}
         echo "--- mptcp endpoints ---"; ip mptcp endpoint show 2>/dev/null
+        {% else %}
+        echo "--- mwan3 ---"; mwan3 status
+        {% endif %}
         echo "--- defaults ---"; ip route | grep default
       changed_when: false
       register: report
-      when: (state | default('present')) == 'present'
+      when: (state | default('present')) == 'present' and not ansible_check_mode
 
     - name: Bond status
       ansible.builtin.debug:
         msg: "{{ report.stdout_lines }}"
-      when: (state | default('present')) == 'present'
+      when: (state | default('present')) == 'present' and not ansible_check_mode
