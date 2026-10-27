@@ -1,112 +1,75 @@
 # Steering a client to one uplink: what actually happens on OMR
 
 Measured 2026-10-26 on the bench GL-MT6000, OpenMPTCProuter v0.64.2-6.18,
-kernel 6.18.39. This note exists because the obvious implementation **looks
-like it works and does not**, and the failure is silent.
+kernel 6.18.39.
 
-## What was tried
+**Correction first.** Two earlier attempts were reported here as failures on the
+strength of a test client at `192.168.50.180`. That client was **not routed
+through the router at all**: this host's default route left via a different
+network (`192.168.1.1`). Every byte counted during those tests was unrelated
+traffic, so those "measurements" proved nothing. The harness now pins the
+interface (`curl --interface <lan-nic>`) and the packet counters on the router
+are checked to move before any conclusion is drawn.
 
-Per-client policy routing, the textbook way: one rule per client, in a
-preference band the role owns.
+## What OMR actually does with LAN client traffic
 
-```text
-$ ansible-playbook -i inventory/hosts.yml playbook-client-tables.yml \
-    -e '{"client_tables_clients":[{"ip":"192.168.50.180","objective":"minimize_cost"}]}'
-$ ip rule list | awk '$1 ~ /^120/'
-12000:	from 192.168.50.180 lookup 11
-12100:	from 192.168.50.180 to 192.168.50.0/24 lookup lan
-```
-
-Uplink tables on this box: `wan3` → 11, `wwan` → 13 (from
-`uci network.<iface>.ip4table`). Both have a default route. The rules installed,
-a second run reported `changed=0`, and `state=absent` removed them cleanly.
-
-## Why it does nothing
+`nft … trace` on a live flow from a correctly-routed client:
 
 ```text
-$ ip route get 1.1.1.1 from 192.168.50.180
-RTNETLINK answers: Network unreachable
+inet ztrace pre            rule ip saddr 192.168.50.10 ip protocol tcp counter   (verdict continue)
+inet fw4 raw_prerouting    policy accept
+inet fw4 mangle_prerouting policy accept
+inet fw4 omr_bypass_reply  policy accept
+inet fw4 dstnat            rule … (verdict jump)
+inet fw4 ss_rules_pre_tcp  rule … (verdict goto)
+inet fw4 ss_rules_forward_tcp rule meta l4proto tcp redirect to :1100 (verdict accept)
 ```
-
-and 20 MB pulled from that client moved over the wireless uplink, not the wired
-one the rule named:
 
 ```text
-lan3  rx +117,622 B
-phy1  rx +21,956,622 B      <- ~21 MB over Wi-Fi
+$ nft list chain inet fw4 ss_rules_forward_tcp
+meta l4proto tcp redirect to :1100
+$ netstat -ltnp | grep :1100
+tcp  0  0 :::1100  :::*  LISTEN  25453/sslocal
+$ ps w | grep sslocal
+25453 root  /usr/bin/sslocal -c /var/etc/shadowsocks-rust/ss_redir.hi1.json
 ```
 
-The reason is OMR's own steering: LAN client TCP is TPROXY-marked in nft
-prerouting (`meta mark set 0x1`, then `tproxy ip to :tproxy_port`), and OMR
-installs
+So client TCP is **REDIRECTed to a local `ss-redir` (shadowsocks-rust) on port
+1100**, which terminates the connection and opens its own outbound socket. No
+mark is set on the client's packets, and there is no TPROXY in this build — the
+`fwmark 0x1 lookup 100` rule belongs to another path.
 
-```text
-0:	from all fwmark 0x1 lookup 100
-```
+## Consequences
 
-at **preference 0**. Routing therefore resolves the fwmark rule before any
-`from <client>` rule can be consulted, and the packet is delivered locally to
-the transparent proxy instead of being forwarded out an uplink table. A
-source-based rule at pref 12000 is unreachable by construction — not
-misconfigured, not slow, just downstream of a higher-priority verdict.
+1. **A `from <client>` routing rule cannot work.** The packet is delivered
+   locally at `nat`/prerouting; it never reaches routing as a forwardable packet.
+2. **A packet mark on the client cannot work either.** Even a correct
+   `0x4539<table>` mark would only affect a packet that is already being
+   delivered to `sslocal`; the uplink is chosen afterwards, by the proxy.
+3. **The egress decision belongs to the proxy process**, and so does metering:
+   the TollGate session that bills the buyer is on that same path. Steering a
+   client per-uplink therefore cannot be done by firewall rules on this
+   architecture, and any implementation that bypasses port 1100 also bypasses
+   accounting.
 
-## The consequence that matters for TollGate
+## What an implementation would have to look like
 
-On OMR, the bond path is also where accounting lives: TPROXY → bond → the
-TollGate session that meters and bills. Pinning a client to a raw uplink table
-bypasses that, so a "minimize cost" client would egress **unmetered**. Any buyer
-steering on OMR must therefore pick an uplink **without leaving the accounted
-path**, or the price the buyer sees stops matching what they consume.
+Either
 
-## What the correct implementation must do
+- **per-uplink proxy instances** — two `ss-redir` listeners, each with its own
+  outbound path, and a `nat` rule per client selecting the redirect port, so the
+  owning instance still meters; or
+- **no per-uplink steering at all** on OMR, with objectives expressed only as
+  "bond" (all uplinks, kernel-scheduled) and price differentiation handled by the
+  TollGate session instead of by the router.
 
-Set the packet's mark to the *uplink's own* OMR mark (`0x4539xx`, the scheme OMR
-already routes: `0x453911` → table 11, `0x453913` → table 13) in a chain that
-runs **before** the TPROXY chain, with a final `accept` for that packet. Two
-consequences to decide first, because they are product decisions, not code:
-
-1. Does a steered client still get metered? If the mark bypasses the proxy, it
-   does not — unless the meter sits on the forwarding path rather than in the
-   proxy.
-2. Does "balanced" on OMR mean "the bond" (all uplinks, kernel-scheduled)? It
-   must, because the kernel exposes no weight knob.
-
-Until those are answered, this repository ships **no** per-client steering. The
-`pr/client-tables` branch keeps the role and its nine offline tests as the basis
-for the mark-based version; it is deliberately unmerged.
-
-## Second attempt: set the mark early (also insufficient)
-
-A mark-based variant was built and run: an `inet` chain at `priority mangle - 20`
-(-170, ahead of OMR's `-160`) setting the uplink's own OMR mark
-(`0x453911` for table 11) with `accept`, plus a `counter`. Rendered fragment is
-derived from `uci network.<iface>.ip4table` and validated with `nft -c`.
-
-It installs, self-verifies, and reverts cleanly, and the counter proves the rule
-**does** match client traffic:
-
-```text
-nft list table inet client_egress
-  ip saddr 192.168.50.180 counter packets 849 bytes 65032 meta mark set 0x00453911 accept
-```
-
-But the traffic still did not follow the mark. A 20 MB download from that client
-moved:
-
-```text
-lan3 rx +355,752 B        <- the uplink the mark named (table 11)
-phy1 rx +30,296,125 B     <- the uplink that carried it
-counter +67 packets       <- but a 20 MB transfer is ~14k packets
-```
-
-So the rule sees only a sliver of the client's packets (the rest are handled
-before it, or re-marked downstream), and egress stays on the bond. Marking at
-prerouting is therefore **not** sufficient either. Establishing the real
-mechanism needs `nft ... trace` on a live flow, which is a deliberate
-instrumented session, not a guess.
+The second is what the current code effectively supports. The first is a proxy
+architecture change, not an Ansible knob, and it needs a decision about who owns
+the meter when two instances exist.
 
 ## Status
 
-No per-client steering ships. The two roles (`pr/client-tables`, and the
-mark-based `pr/client-egress`) are kept unmerged with their tests; this file is
-the record of what was measured.
+No per-client steering ships. `pr/client-tables` (source rules) and
+`pr/client-egress` (packet marks) are kept unmerged with their tests as negative
+results, because a role that installs cleanly and does nothing is worse than no
+role.
