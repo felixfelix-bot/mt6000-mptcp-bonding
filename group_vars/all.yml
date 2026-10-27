@@ -82,6 +82,22 @@ mt6000_authorized_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP6hWTsriB0pGcQjUOBm0yUlKIVuTMHbm0vvpQZKUi+1 t14-mt6000-2026"
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBXpTNvCZscqPoACa8p6YnwfvGDHTEIot1GmE56D7Hl+ tollgate-virtual-lab"
 
+# --- Per-uplink proxy instances (roles/uplink_proxies) -----------------------
+# LAN TCP is REDIRECTed into ss-redir, so the uplink is chosen by the proxy.
+# One instance per uplink, one client per instance: pinned session => one meter.
+uplink_proxy_base_port: 1100
+uplink_proxy_source_config: /var/etc/shadowsocks-rust/ss_redir.hi1.json
+uplink_proxy_config_dir: /etc/uplink-proxies
+uplink_proxy_init: /etc/init.d/uplink-proxies
+uplink_proxy_fragment: /etc/nftables.d/50-uplink-proxies.nft
+uplink_proxy_table: uplink_proxies
+uplink_proxy_exempt_cidrs: ["192.168.50.0/24"]
+uplink_proxies:
+  - {objective: minimize_cost,  iface: lan3,       port: 1101}
+  - {objective: maximize_speed, iface: phy1-sta0,  port: 1102}
+uplink_proxy_clients: []
+#  - {ip: 192.168.50.10, objective: minimize_cost}
+
 # --- Paths ------------------------------------------------------------------
 mptcp_init_path: "/etc/init.d/mptcp-bond"
 xray_config_path: "/tmp/xray-bond.json"

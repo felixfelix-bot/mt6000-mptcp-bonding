@@ -187,3 +187,35 @@ MT6000_HOST=192.168.50.1 MT6000_KEY=~/.ssh/id_ed25519 \
 
 Re-running is a no-op (`changed=0`) once the keys are present — measured on the
 bench, `ok=5 changed=0`, two keys installed.
+
+## Per-client egress by uplink (roles/uplink_proxies)
+
+LAN TCP is REDIRECTed into a local `ss-redir`, so the uplink is chosen by the
+proxy, not by routing (see `docs/STEERING-LIMITS.md`). This role runs **one proxy
+instance per uplink**, bound with `outbound_bind_interface` and `mptcp: false`, and
+redirects each client to its own instance:
+
+```sh
+ansible-playbook -i inventory/hosts.yml playbook-uplink-proxies.yml
+ansible-playbook -i inventory/hosts.yml playbook-uplink-proxies.yml -e state=absent
+```
+
+**Session model.** A buyer's session is pinned to one uplink until it ends
+(`allow_change: next_session`), so it maps to exactly one instance and therefore
+exactly one meter. Sessions are meant to be **small and frequent**; paying per
+session rather than per month is what makes a wrong choice cheap to correct.
+Later, spillmann channels will let a session be closed early and re-opened on a
+different uplink — at that point a session still never spans two uplinks, it just
+becomes shorter.
+
+**Metering.** Both ends meter independently, so either side can decide to stop
+doing business with the other. On the router the meter is two nft counters per
+client: upload (`chain up`, filter/prerouting — every packet) and download
+(`chain down`, filter/postrouting). The redirect rule itself is **not** a meter:
+NAT chains only see the first packet of a connection. Measured: a 20,000,000-byte
+download moved the down counter by 20,092,835 bytes and the up counter by 91,057.
+
+**User-facing expectation.** Because the choice is pinned until the session ends,
+the portal must say so where the choice is made — e.g. "Applies to your next
+session; your current session keeps its current gateway until it ends." Never
+imply a switch is immediate.

@@ -1,0 +1,245 @@
+---
+# Render, install and verify per-uplink proxy instances + per-client redirect and
+# per-client byte counters. Idempotent; `state=absent` removes everything it made.
+
+- name: Validate inputs
+  ansible.builtin.assert:
+    that:
+      - uplink_proxies | length > 0
+      - uplink_proxy_clients | length > 0
+      - uplink_proxy_base_port | int >= 1024
+    fail_msg: "uplink_proxies, uplink_proxy_clients and a port >= 1024 are required"
+
+- name: Every client must name a configured proxy, and ports must be unique
+  ansible.builtin.assert:
+    that:
+      - item.objective in (uplink_proxies | map(attribute='objective') | list)
+    fail_msg: "client {{ item.ip }} names objective {{ item.objective }}, which has no proxy instance"
+  loop: "{{ uplink_proxy_clients }}"
+  loop_control:
+    label: "{{ item.ip }}"
+
+- name: Ports must be distinct and above the stock instance
+  ansible.builtin.assert:
+    that:
+      - (uplink_proxies | map(attribute='port') | list | unique | length) == (uplink_proxies | length)
+      - (uplink_proxies | map(attribute='port') | map('int') | min) > (uplink_proxy_base_port | int)
+    fail_msg: "proxy ports must be unique and greater than uplink_proxy_base_port"
+
+- name: Uplink interfaces must exist on this box
+  ansible.builtin.raw: |
+    set -eu
+    {% for p in uplink_proxies %}
+    [ -e /sys/class/net/{{ p.iface }} ] || { echo "NO_IFACE: {{ p.iface }} ({{ p.objective }})"; exit 1; }
+    {% endfor %}
+    echo IFACES_OK
+  register: up_ifaces
+  changed_when: false
+
+- name: Every client address must be routable on a local bridge
+  ansible.builtin.raw: |
+    set -eu
+    {% for c in uplink_proxy_clients %}
+    ip neigh 2>/dev/null | grep -q "^{{ c.ip }} " || true
+    {% endfor %}
+    echo CLIENTS_CHECKED
+  register: up_clients
+  changed_when: false
+
+- name: Create the config directory
+  ansible.builtin.raw: |
+    if [ -d {{ uplink_proxy_config_dir }} ]; then
+      echo DIR_EXISTS
+    else
+      mkdir -p {{ uplink_proxy_config_dir }} && chmod 700 {{ uplink_proxy_config_dir }} && echo DIR_CREATED
+    fi
+  register: up_dir
+  changed_when: "'DIR_CREATED' in up_dir.stdout"
+
+- name: Render one config per uplink instance (mptcp off, bound to its interface)
+  ansible.builtin.raw: |
+    set -eu
+    SRC={{ uplink_proxy_source_config }}
+    [ -f "$SRC" ] || { echo "NO_SOURCE_CONFIG: $SRC"; exit 1; }
+    {% for p in uplink_proxies %}
+    OUT={{ uplink_proxy_config_dir }}/{{ p.objective }}.json
+    NEW=$OUT.new
+    sed -e 's/"local_port": *[0-9]*/"local_port": {{ p.port }}/' \
+        -e 's/"mptcp": *true/"mptcp": false/' \
+        "$SRC" > "$NEW"
+    # The outbound binding is what pins this instance to one uplink. Set it on
+    # the NEW file, and add the key when the source config does not carry it yet.
+    if grep -q '"outbound_bind_interface"' "$NEW"; then
+      sed -i 's/"outbound_bind_interface": *"[^"]*"/"outbound_bind_interface": "{{ p.iface }}"/' "$NEW"
+    else
+      sed -i 's/"local_address": *"[^"]*"/&,\n\t"outbound_bind_interface": "{{ p.iface }}"/' "$NEW"
+    fi
+    jsonfilter -i "$NEW" -e '@.local_port' > /dev/null || { echo "BAD_JSON: $NEW"; exit 1; }
+    if [ -f "$OUT" ] && cmp -s "$NEW" "$OUT"; then
+      rm -f "$NEW"
+    else
+      mv "$NEW" "$OUT"
+      chmod 600 "$OUT"
+      echo "RENDERED {{ p.objective }} port={{ p.port }} iface={{ p.iface }}"
+    fi
+    {% endfor %}
+  register: up_render
+  changed_when: "'RENDERED' in up_render.stdout"
+
+# No python and no sftp-server on this image, so the script is written over raw
+# shell rather than the copy module.
+- name: Install the procd init script that owns these instances
+  ansible.builtin.raw: |
+    NEW={{ uplink_proxy_init }}.new
+    cat > "$NEW" <<'INITEOF'
+    #!/bin/sh /etc/rc.common
+    # Managed by mt6000-mptcp-bonding (roles/uplink_proxies). Edit group_vars.
+    START=95
+    USE_PROCD=1
+
+    start_service() {
+      for f in {{ uplink_proxy_config_dir }}/*.json; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .json)
+        procd_open_instance "$name"
+        procd_set_param command /usr/bin/sslocal -c "$f"
+        procd_set_param respawn 3600 5 5
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+      done
+    }
+    INITEOF
+    if [ -f {{ uplink_proxy_init }} ] && cmp -s "$NEW" {{ uplink_proxy_init }}; then
+      rm -f "$NEW"; echo INIT_SAME
+    else
+      chmod 0755 "$NEW"; mv "$NEW" {{ uplink_proxy_init }}; echo INIT_OK
+    fi
+  register: up_init
+  changed_when: "'INIT_OK' in up_init.stdout"
+
+- name: Enable the init script
+  ansible.builtin.raw: "{{ uplink_proxy_init }} enable >/dev/null 2>&1 || true; echo ENABLED"
+  changed_when: false
+
+- name: Restart the instances when their configs or the init script changed
+  ansible.builtin.raw: |
+    set -eu
+    if {{ uplink_proxy_init }} running 2>/dev/null; then
+      {{ uplink_proxy_init }} restart
+    else
+      {{ uplink_proxy_init }} start
+    fi
+    sleep 2
+    echo INSTANCES_STARTED
+  register: up_start
+  changed_when: "'INSTANCES_STARTED' in up_start.stdout"
+  when: up_render.changed or up_init.changed
+
+- name: Start the instances if they are not running
+  ansible.builtin.raw: |
+    set -eu
+    if {{ uplink_proxy_init }} running 2>/dev/null; then
+      echo ALREADY_RUNNING
+    else
+      {{ uplink_proxy_init }} start; sleep 2; echo INSTANCES_STARTED
+    fi
+  register: up_start_idle
+  changed_when: "'INSTANCES_STARTED' in up_start_idle.stdout"
+  when: not (up_render.changed or up_init.changed)
+
+- name: Render the redirect + per-client counters fragment
+  ansible.builtin.raw: |
+    set -eu
+    F={{ uplink_proxy_fragment }}
+    NEW=$F.new
+    {
+      echo "# Managed by mt6000-mptcp-bonding (roles/uplink_proxies). Edit group_vars."
+      echo "# Client -> its own proxy instance. Session is pinned to one uplink, so one"
+      echo "# client has exactly one instance and therefore one meter."
+      echo "table inet {{ uplink_proxy_table }} {"
+      # 1. Steering: nat prerouting. NAT chains only see the first packet of a
+      #    connection, so these rules must NOT be used as the meter.
+      echo "  chain pre {"
+      echo "    type nat hook prerouting priority -110; policy accept;"
+      {% for c in (uplink_proxy_clients | sort(attribute='ip')) %}
+      {% set proxy = (uplink_proxies | selectattr('objective','equalto',c.objective) | list | first) %}
+      {% for cidr in uplink_proxy_exempt_cidrs | default([]) %}
+      echo "    ip saddr {{ c.ip }} ip daddr {{ cidr }} return"
+      {% endfor %}
+      echo "    ip saddr {{ c.ip }} meta l4proto tcp redirect to :{{ proxy.port }} comment \"{{ c.objective }}\""
+      {% endfor %}
+      echo "  }"
+      echo ""
+      # 2. Meter, upload: a filter chain sees every packet of the flow.
+      echo "  chain up {"
+      echo "    type filter hook prerouting priority -200; policy accept;"
+      {% for c in (uplink_proxy_clients | sort(attribute='ip')) %}
+      {% for cidr in uplink_proxy_exempt_cidrs | default([]) %}
+      echo "    ip saddr {{ c.ip }} ip daddr {{ cidr }} return"
+      {% endfor %}
+      echo "    ip saddr {{ c.ip }} counter comment \"up-{{ c.ip }}\""
+      {% endfor %}
+      echo "  }"
+      echo ""
+      # 3. Meter, download: everything the network sends to the client. No exempt
+      #    rule here: the proxy's own replies come from the router's LAN address.
+      echo "  chain down {"
+      echo "    type filter hook postrouting priority 0; policy accept;"
+      {% for c in (uplink_proxy_clients | sort(attribute='ip')) %}
+      echo "    ip daddr {{ c.ip }} counter comment \"down-{{ c.ip }}\""
+      {% endfor %}
+      echo "  }"
+      echo "}"
+    } > "$NEW"
+    nft -c -f "$NEW" || { echo NFT_INVALID; exit 1; }
+    if [ -f "$F" ] && cmp -s "$NEW" "$F"; then
+      rm -f "$NEW"; echo FRAGMENT_SAME
+    else
+      mv "$NEW" "$F"; echo FRAGMENT_OK
+    fi
+  register: up_frag
+  changed_when: "'FRAGMENT_OK' in up_frag.stdout"
+
+- name: Apply the fragment (replace this table only, and only when it changed)
+  ansible.builtin.raw: |
+    set -eu
+    F={{ uplink_proxy_fragment }}
+    H="$F.sha256"
+    want=$(sha256sum "$F" | awk '{print $1}')
+    have=$(cat "$H" 2>/dev/null || echo none)
+    if [ "$want" = "$have" ] && nft list table inet {{ uplink_proxy_table }} >/dev/null 2>&1; then
+      echo NOOP
+      exit 0
+    fi
+    nft delete table inet {{ uplink_proxy_table }} 2>/dev/null || true
+    nft -f "$F"
+    nft list table inet {{ uplink_proxy_table }} > /dev/null
+    echo "$want" > "$H"
+    echo APPLIED
+  register: up_apply
+  changed_when: "'APPLIED' in up_apply.stdout"
+
+- name: Read back listeners and counters from the box
+  ansible.builtin.raw: |
+    echo "--- listeners"
+    netstat -ltnp 2>/dev/null | grep sslocal | awk '{print $4}' | sort
+    echo "--- rules"
+    nft list table inet {{ uplink_proxy_table }} | grep -E "redirect|comment"
+  register: up_show
+  changed_when: false
+
+- name: Post-condition, every client is redirected to its instance's port
+  ansible.builtin.assert:
+    that:
+      # live nft prints the counter values between 'counter' and 'redirect'
+      - up_show.stdout is search('ip saddr ' + item.ip + ' meta l4proto tcp redirect to :' + ((uplink_proxies | selectattr('objective','equalto',item.objective) | list | first).port | string))
+      - up_show.stdout is search('ip saddr ' + item.ip + ' counter packets [0-9]+ bytes [0-9]+ comment \"up-')
+    fail_msg: "{{ item.ip }} is not redirected to its instance port"
+  loop: "{{ uplink_proxy_clients }}"
+  loop_control:
+    label: "{{ item.ip }} -> {{ item.objective }}"
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "{{ up_show.stdout_lines }}"

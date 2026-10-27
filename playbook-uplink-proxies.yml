@@ -1,0 +1,32 @@
+---
+# Per-client, per-uplink egress. Touches only: /etc/uplink-proxies (configs +
+# init script) and its own nft table `uplink_proxies`.
+#
+#   ansible-playbook -i inventory/hosts.yml playbook-uplink-proxies.yml
+#   ansible-playbook -i inventory/hosts.yml playbook-uplink-proxies.yml -e state=absent
+#
+# Verify from the router, not from this play's recap:
+#   ssh root@<router> 'nft list table inet uplink_proxies; netstat -ltnp | grep sslocal'
+- name: Steer clients to a per-uplink proxy instance
+  hosts: mt6000
+  gather_facts: false
+  tasks:
+    - name: Remove instances and rules when state=absent
+      when: (state | default('present')) == 'absent'
+      block:
+        - name: Stop and disable the init script
+          ansible.builtin.raw: |
+            {{ uplink_proxy_init }} stop 2>/dev/null || true
+            {{ uplink_proxy_init }} disable 2>/dev/null || true
+            echo STOPPED
+
+        - name: Remove the table, the fragment, the init script and the configs
+          ansible.builtin.raw: |
+            nft delete table inet {{ uplink_proxy_table }} 2>/dev/null || true
+            rm -f {{ uplink_proxy_fragment }} {{ uplink_proxy_init }}
+            rm -rf {{ uplink_proxy_config_dir }}
+            echo CLEARED
+
+    - name: Reconcile when state=present
+      ansible.builtin.import_tasks: roles/uplink_proxies/tasks/main.yml
+      when: (state | default('present')) == 'present'

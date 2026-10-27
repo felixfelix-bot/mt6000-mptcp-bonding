@@ -1,0 +1,35 @@
+---
+# One proxy instance per uplink, one client per instance, one meter per client.
+#
+# Why: on OpenMPTCProuter LAN TCP is REDIRECTed into a local ss-redir, so the
+# uplink is chosen by the proxy, not by routing. A per-uplink instance bound with
+# outbound_bind_interface steers correctly (bench: 20 MB -> the bound uplink,
+# other uplink flat), and `mptcp: false` is required or subflows spread over the
+# bond. See docs/STEERING-LIMITS.md.
+#
+# Session model: a buyer's session is pinned to one uplink until it ends
+# (allow_change: next_session), therefore one instance, therefore one meter. Both
+# endpoints meter independently so either side can stop the relationship.
+uplink_proxies_enabled: false
+
+# Stock instance lives on 1100 and carries the bonded path; per-uplink instances
+# take distinct ports above it.
+uplink_proxy_base_port: 1100
+uplink_proxy_source_config: /var/etc/shadowsocks-rust/ss_redir.hi1.json
+uplink_proxy_config_dir: /etc/uplink-proxies
+uplink_proxy_init: /etc/init.d/uplink-proxies
+uplink_proxy_fragment: /etc/nftables.d/50-uplink-proxies.nft
+uplink_proxy_table: uplink_proxies
+
+# Traffic to these destinations is never redirected (keeps the router reachable).
+uplink_proxy_exempt_cidrs:
+  - 192.168.50.0/24
+
+# objective -> uplink interface + instance port.
+uplink_proxies: []
+#  - {objective: minimize_cost,  iface: lan3,       port: 1101}
+#  - {objective: maximize_speed, iface: phy1-sta0,  port: 1102}
+
+# client -> objective. Pinned for the whole session.
+uplink_proxy_clients: []
+#  - {ip: 192.168.50.10, objective: minimize_cost}
