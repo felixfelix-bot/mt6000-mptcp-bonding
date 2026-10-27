@@ -67,6 +67,46 @@ The second is what the current code effectively supports. The first is a proxy
 architecture change, not an Ansible knob, and it needs a decision about who owns
 the meter when two instances exist.
 
+## The mechanism that can work: per-uplink proxy instances
+
+`sslocal` on this image supports binding its **outbound** socket:
+
+```text
+--outbound-bind-addr <ADDR>        bind address, outbound socket will bind this address
+--outbound-bind-interface <IFACE>  SO_BINDTODEVICE for outbound sockets
+--outbound-fwmark <MARK>           SO_MARK for outbound sockets
+```
+
+and the same key works in the JSON config (`"outbound_bind_interface": "lan3"`). A
+second instance was started on port 1101 with that key and listened successfully:
+
+```text
+tcp  0  0 :::1100  LISTEN  25453/sslocal     <- existing, bond path
+tcp  0  0 :::1101  LISTEN  24319/sslocal     <- new, bound to lan3
+```
+
+So the shape is: one `ss-redir` per uplink, each bound to that uplink, plus a
+`nat` rule per client selecting the redirect port. Each instance keeps its own
+meter, which is the property that matters for billing.
+
+**Not finished:** routing the test client's TCP to :1101 and completing a download
+through it. The attempt returned a 1-byte response and was abandoned once the
+next item came up; that is an unfinished experiment, not a result.
+
+## Hazard found the hard way
+
+A `nat` redirect matching the test client's source address **also captured SSH to
+the router**, because the rule redirected every TCP flow from that host, including
+`root@192.168.50.1:22`. SSH died mid-session and the box was unreachable from that
+host. Recovered through another LAN machine (dq05) using SSH agent forwarding —
+no private key was copied anywhere — then the rule was deleted.
+
+Two rules for anyone repeating this:
+
+1. Always add `ip daddr != <router-ip>` (and your management host) to a redirect
+   rule, or scope it by the client's outbound port set.
+2. Have an out-of-band path to the box **before** testing redirects, not after.
+
 ## Status
 
 No per-client steering ships. `pr/client-tables` (source rules) and
