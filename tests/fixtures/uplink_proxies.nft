@@ -1,0 +1,16 @@
+table inet uplink_proxies {
+	chain pre {
+		type nat hook prerouting priority dstnat - 10; policy accept;
+		ip saddr 192.168.50.10 ip daddr 192.168.50.0/24 return
+		ip saddr 192.168.50.10 meta l4proto tcp redirect to :1101 comment "minimize_cost"
+	}
+	chain up {
+		type filter hook prerouting priority -200; policy accept;
+		ip saddr 192.168.50.10 ip daddr 192.168.50.0/24 return
+		ip saddr 192.168.50.10 counter packets 1734 bytes 91057 comment "up-192.168.50.10"
+	}
+	chain down {
+		type filter hook postrouting priority filter; policy accept;
+		ip daddr 192.168.50.10 counter packets 819 bytes 20092835 comment "down-192.168.50.10"
+	}
+}
