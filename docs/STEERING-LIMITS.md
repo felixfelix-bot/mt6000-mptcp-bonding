@@ -63,9 +63,10 @@ Either
   "bond" (all uplinks, kernel-scheduled) and price differentiation handled by the
   TollGate session instead of by the router.
 
-The second is what the current code effectively supports. The first is a proxy
-architecture change, not an Ansible knob, and it needs a decision about who owns
-the meter when two instances exist.
+The second is what the current code effectively supports. The first is now
+demonstrated to work (above) and is an Ansible-shaped change; what remains is the
+product decision: **who owns the meter when two instances exist** — the instance a
+client is redirected to, or the TollGate session in front of both.
 
 ## The mechanism that can work: per-uplink proxy instances
 
@@ -89,9 +90,29 @@ So the shape is: one `ss-redir` per uplink, each bound to that uplink, plus a
 `nat` rule per client selecting the redirect port. Each instance keeps its own
 meter, which is the property that matters for billing.
 
-**Not finished:** routing the test client's TCP to :1101 and completing a download
-through it. The attempt returned a 1-byte response and was abandoned once the
-next item came up; that is an unfinished experiment, not a result.
+**Proven, both directions.** Test client `192.168.50.10` on the LAN, router
+counters read before and after each transfer (idle background on this box is
+~1,750 KB/10 s on lan3 and ~1,463 KB/10 s on phy1, so the signal has to beat
+that):
+
+```text
+instance bound to lan3 (:1101), 3 x 20 MB from the client
+  lan3 rx +64,509 KB        <- carried the transfer
+  phy1 rx + 2,639 KB        <- background only
+
+instance bound to phy1-sta0 (:1102), 20 MB
+  lan3 rx +   482 KB        <- background only
+  phy1 rx +20,827 KB        <- carried the transfer
+```
+
+Both downloads returned `rc=200`, and the client's redirect was the only thing
+changed between the two runs. So per-client, per-uplink egress **is** achievable
+on this platform, with the proxy instance doing the steering.
+
+One detail that is easy to get wrong: an instance started with `"mptcp": true`
+(the stock config) still spreads its outbound subflows across the bond, and the
+transfer splits — a 2 MB pull moved ~1.0 MB out of lan3 and ~1.2 MB out of phy1.
+The instance must set `"mptcp": false` to pin to one uplink.
 
 ## Hazard found the hard way
 
@@ -109,7 +130,15 @@ Two rules for anyone repeating this:
 
 ## Status
 
-No per-client steering ships. `pr/client-tables` (source rules) and
-`pr/client-egress` (packet marks) are kept unmerged with their tests as negative
-results, because a role that installs cleanly and does nothing is worse than no
-role.
+- **Firewall-level steering: disproven.** `pr/client-tables` (source rules) and
+  `pr/client-egress` (packet marks) are kept unmerged with their tests as negative
+  results, because a role that installs cleanly and does nothing is worse than no
+  role.
+- **Proxy-instance steering: proven by hand**, both directions, with router
+  counters as evidence (above).
+- **Not yet automated:** the per-uplink instances and the per-client redirect
+  rules exist only as the commands in this document. Turning them into a role
+  needs the metering decision first, so that the role can encode one owner of the
+  byte counters instead of two.
+- **Not yet decided:** whether a steered client is metered by the instance it is
+  redirected to, or by a session in front of both instances.
